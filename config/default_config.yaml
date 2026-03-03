@@ -1,0 +1,56 @@
+# YOLO Smart Home - Default Configuration
+#
+# Face Detection Model: yolov8n-face.pt from derronqi/yolov8-face
+# Download from: https://drive.google.com/file/d/1qcr9DbgsX3ryrz2uU8w4Xm3cOrRywXqb/view?usp=sharing
+# Place in: data/models/
+
+video:
+  source: "camera"  # camera, rtsp, file
+  path: "0"         # 0 for default webcam, RTSP URL, or video file path
+  fps: 30
+  resolution: [1280, 720]
+  queue_size: 10
+
+detection:
+  device: "auto"    # auto, mps, cpu, cuda
+  confidence: 0.5
+  iou: 0.45
+  max_detections: 10
+
+person_detection:
+  enabled: true
+  model: "yolov10n.pt"
+  min_confidence: 0.5
+
+face_recognition:
+  enabled: true
+  model: "GhostFaceNet"  # GhostFaceNet, ArcFace, Facenet512, VGG-Face
+  threshold: 0.45          # Cosine similarity threshold (lower = more permissive)
+  database_path: "data/embeddings/faces.pkl"
+  detector_model: "yolov8n-face.pt"  # From derronqi/yolov8-face repo
+  alignment_backend: "fan"           # fan (FAN 68-landmark), deepface (legacy Haar), none
+
+fall_detection:
+  enabled: true
+  aspect_ratio_threshold: 2.5  # width/height for fallen person
+  min_frames_for_fall: 5       # Consecutive frames required
+  alert_cooldown: 30           # Seconds between fall alerts
+  pose_model: "yolov8n-pose.pt"
+
+gesture_detection:
+  enabled: true
+  smoothing_window: 5          # Frames for temporal smoothing
+  min_confidence: 0.7
+  pose_model: "yolov8n-pose.pt"
+
+alerts:
+  console: true
+  log_file: "data/logs/events.jsonl"
+  screenshot_on_event: true
+  screenshot_path: "data/logs/screenshots"
+
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
+  rotation: "10 MB"
+  retention: "7 days"
