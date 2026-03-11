@@ -54,6 +54,8 @@ env/
 *~
 
 # Project specific
+*.pt
+*.onnx
 data/models/*.pt
 data/models/*.onnx
 data/embeddings/*.pkl
@@ -78,3 +80,4 @@ Thumbs.db
 # Claude
 .claude/
 .claude/projects/
+CLAUDE.md
