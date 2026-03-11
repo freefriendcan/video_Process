@@ -409,11 +409,10 @@ def register_face(name, source, path, config, faces):
             )
             x1, y1, x2, y2 = face_data["box"]
 
-            # Use padded ROI for better alignment during embedding extraction
-            from .recognizers.face_recognizer import FaceRecognizer as FR
-            face_roi = FR._extract_padded_roi(frame, x1, y1, x2, y2)
+            box = [x1, y1, x2, y2]
+            face_crop = frame[y1:y2, x1:x2]
 
-            if recognizer.register_face(face_roi, name):
+            if recognizer.register_face(face_crop, name, frame=frame, box=box):
                 captured_count += 1
                 print(f"Captured {captured_count}/{faces}")
 

@@ -1,6 +1,6 @@
 """Pose estimation using YOLOv8-pose."""
 
-from typing import Any
+from typing import Any, Optional, List
 
 import numpy as np
 
@@ -129,7 +129,7 @@ class PoseDetector(BaseDetector):
             "poses": [],
         }
 
-    def get_keypoints(self, frame: np.ndarray, person_idx: int = 0) -> np.ndarray | None:
+    def get_keypoints(self, frame: np.ndarray, person_idx: int = 0) -> Optional[np.ndarray]:
         """
         Get keypoints for a specific person.
 
@@ -152,7 +152,7 @@ class PoseDetector(BaseDetector):
         # Combine into (17, 3) array
         return np.column_stack([kpts, conf])
 
-    def get_visible_keypoints(self, frame: np.ndarray, min_confidence: float = 0.5) -> list[dict]:
+    def get_visible_keypoints(self, frame: np.ndarray, min_confidence: float = 0.5) -> List[dict]:
         """
         Get list of visible keypoints above confidence threshold.
 

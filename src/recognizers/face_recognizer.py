@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from deepface import DeepFace
+import cv2
 from loguru import logger
 
 from ..config.settings import Config
@@ -26,6 +27,13 @@ INCREMENTAL_LEARN_THRESHOLD = 0.65
 TRACKING_IOU_THRESHOLD = 0.4
 # Seconds before a tracked face must be re-recognized
 TRACKING_TIMEOUT = 2.0
+
+# Quality Gate thresholds for incremental learning
+MIN_LEARN_FACE_SIZE = 80          # Minimum face size for learning (vs 40 for recognition)
+MIN_LAPLACIAN_VAR = 80            # Blur threshold (lower = blurry)
+MAX_POSE_ANGLE = 15.0             # Max yaw/pitch angle in degrees
+MIN_TRACK_FRAMES = 3              # Min frames tracked before learning
+LEARN_INTERVAL_FRAMES = 30        # Re-evaluate learning every N tracked frames
 
 
 class TrackedFace:
@@ -118,23 +126,46 @@ class FaceRecognizer:
 
     # ── Registration ────────────────────────────────────────────────────
 
-    def register_face(self, face_image: np.ndarray, name: str) -> bool:
+    def register_face(
+        self,
+        face_image: np.ndarray,
+        name: str,
+        *,
+        frame: np.ndarray | None = None,
+        box: list | None = None,
+    ) -> bool:
         """
         Register a face (appends embedding with alignment).
 
-        Alignment is determined by alignment_backend config:
-        - 'fan': FAN 68-landmark alignment (SOTA)
-        - 'deepface': Legacy DeepFace internal alignment
-        - 'none': No alignment
+        When frame + box are provided, a padded ROI is extracted internally
+        for embedding consistency with the recognition pipeline.
+        Otherwise falls back to using face_image directly (backward compat).
+
+        Args:
+            face_image: Cropped face region (used as fallback)
+            name: Person's name
+            frame: Original full frame (optional, preferred)
+            box: Face bounding box [x1, y1, x2, y2] (optional, required with frame)
         """
         try:
-            h, w = face_image.shape[:2]
-            if h < MIN_FACE_SIZE or w < MIN_FACE_SIZE:
-                logger.warning(f"Face too small ({w}x{h}), skipping registration")
-                return False
+            # Prefer frame+box for consistent padded embedding
+            if frame is not None and box is not None:
+                x1, y1, x2, y2 = box
+                face_w, face_h = x2 - x1, y2 - y1
+                if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE:
+                    logger.warning(f"Face too small ({face_w}x{face_h}), skipping registration")
+                    return False
+                roi = self._extract_padded_roi(frame, x1, y1, x2, y2)
+                logger.debug("Registration: using padded ROI from frame+box")
+            else:
+                h, w = face_image.shape[:2]
+                if h < MIN_FACE_SIZE or w < MIN_FACE_SIZE:
+                    logger.warning(f"Face too small ({w}x{h}), skipping registration")
+                    return False
+                roi = face_image
+                logger.debug("Registration: using provided face_image (no frame+box)")
 
-            # Registration uses FAN/deepface alignment based on config
-            embedding = self._extract_embedding(face_image, align=True)
+            embedding = self._extract_embedding(roi)
             if embedding is None:
                 return False
 
@@ -161,23 +192,80 @@ class FaceRecognizer:
 
     # ── Incremental Learning ────────────────────────────────────────────
 
-    def _maybe_learn(self, name: str, embedding: np.ndarray, similarity: float) -> None:
-        """Auto-add embedding if confidence is high and cap not reached."""
+    def _maybe_learn(
+        self,
+        name: str,
+        embedding: np.ndarray,
+        similarity: float,
+        face_roi: np.ndarray,
+        face_w: int,
+        face_h: int,
+        landmarks_68: np.ndarray | None = None,
+        track_frame_count: int = 0,
+    ) -> None:
+        """Auto-add embedding if confidence is high and quality gate passes."""
         if similarity < INCREMENTAL_LEARN_THRESHOLD:
+            logger.debug(f"Learning rejected: low similarity ({similarity:.3f} < {INCREMENTAL_LEARN_THRESHOLD})")
             return
 
+        # Quality gate check
+        passed, reason = self._check_quality_gate(
+            face_roi, face_w, face_h, landmarks_68, track_frame_count,
+        )
+        if not passed:
+            logger.debug(f"Learning rejected for '{name}': {reason}")
+            return
+
+        # Cap check
         embeddings = self.known_faces.get(name, [])
         if len(embeddings) >= MAX_EMBEDDINGS_PER_PERSON:
+            logger.debug(f"Learning rejected for '{name}': cap reached ({MAX_EMBEDDINGS_PER_PERSON})")
             return
 
-        # Check it's sufficiently different from existing embeddings (avoid duplicates)
+        # Duplicate check
         for existing in embeddings:
             if self._cosine_similarity(embedding, existing) > 0.95:
+                logger.debug(f"Learning rejected for '{name}': duplicate embedding")
                 return
 
         self.known_faces[name].append(embedding)
         self._save_database()
-        logger.debug(f"Incremental learn: added embedding for '{name}' (total: {len(self.known_faces[name])})")
+        logger.info(f"Incremental learn: added embedding for '{name}' (total: {len(self.known_faces[name])})")
+
+    def _check_quality_gate(
+        self,
+        face_roi: np.ndarray,
+        face_w: int,
+        face_h: int,
+        landmarks_68: np.ndarray | None = None,
+        track_frame_count: int = 0,
+    ) -> tuple[bool, str]:
+        """Check if a face meets quality thresholds for incremental learning.
+
+        Returns:
+            (passed, reason) - if passed=False, reason explains why
+        """
+        # 1. Size check
+        if face_w < MIN_LEARN_FACE_SIZE or face_h < MIN_LEARN_FACE_SIZE:
+            return False, f"face too small ({face_w}x{face_h} < {MIN_LEARN_FACE_SIZE})"
+
+        # 2. Blur check (Laplacian variance)
+        gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < MIN_LAPLACIAN_VAR:
+            return False, f"too blurry (laplacian={laplacian_var:.1f} < {MIN_LAPLACIAN_VAR})"
+
+        # 3. Pose check (if landmarks available and aligner exists)
+        if landmarks_68 is not None and self.aligner is not None:
+            yaw, pitch, _roll = self.aligner.estimate_pose(landmarks_68)
+            if abs(yaw) > MAX_POSE_ANGLE or abs(pitch) > MAX_POSE_ANGLE:
+                return False, f"bad pose (yaw={yaw:.1f}°, pitch={pitch:.1f}° > {MAX_POSE_ANGLE}°)"
+
+        # 4. Temporal consistency check
+        if track_frame_count < MIN_TRACK_FRAMES:
+            return False, f"not tracked long enough ({track_frame_count} < {MIN_TRACK_FRAMES} frames)"
+
+        return True, "quality gate passed"
 
     # ── Face Tracking ───────────────────────────────────────────────────
 
@@ -250,6 +338,21 @@ class FaceRecognizer:
         if tracked and tracked.name is not None:
             tracked.update(box)
             logger.debug(f"Tracking: reused identity '{tracked.name}' (frame {tracked.frame_count})")
+
+            # Periodic learning: every N frames, re-evaluate quality gate
+            if tracked.frame_count % LEARN_INTERVAL_FRAMES == 0:
+                face_roi = self._extract_padded_roi(frame, x1, y1, x2, y2)
+                embedding = self._extract_embedding(face_roi)
+                if embedding is not None:
+                    landmarks_68 = None
+                    if self.aligner is not None:
+                        landmarks_68 = self.aligner.get_landmarks(face_roi)
+                    self._maybe_learn(
+                        tracked.name, embedding, tracked.confidence,
+                        face_roi, face_w, face_h,
+                        landmarks_68, tracked.frame_count,
+                    )
+
             return {
                 "face_found": True,
                 "name": tracked.name,
@@ -260,7 +363,7 @@ class FaceRecognizer:
 
         # No track match — run recognition with configured alignment
         face_roi = self._extract_padded_roi(frame, x1, y1, x2, y2)
-        embedding = self._extract_embedding(face_roi, align=False)
+        embedding = self._extract_embedding(face_roi)
         if embedding is None:
             return self._empty_result()
 
@@ -270,8 +373,19 @@ class FaceRecognizer:
             name, similarity = best_match
             logger.debug(f"Recognized '{name}' with similarity {similarity:.3f}")
 
-            # Incremental learning
-            self._maybe_learn(name, embedding, similarity)
+            # Get landmarks for quality gate (if FAN is active)
+            landmarks_68 = None
+            if self.aligner is not None:
+                landmarks_68 = self.aligner.get_landmarks(face_roi)
+
+            frame_count = tracked.frame_count if tracked else 1
+
+            # Incremental learning with quality gate
+            self._maybe_learn(
+                name, embedding, similarity,
+                face_roi, face_w, face_h,
+                landmarks_68, frame_count,
+            )
 
             # Update or create track
             if tracked:
@@ -321,7 +435,7 @@ class FaceRecognizer:
                 continue
 
             face_roi = self._extract_padded_roi(frame, x1, y1, x2, y2)
-            embedding = self._extract_embedding(face_roi, align=False)
+            embedding = self._extract_embedding(face_roi)
 
             if embedding is not None:
                 best_match = self._find_best_match(embedding)
@@ -329,7 +443,17 @@ class FaceRecognizer:
                 confidence = best_match[1] if best_match else 0.0
 
                 if name and best_match:
-                    self._maybe_learn(name, embedding, best_match[1])
+                    # Get landmarks for quality gate (if FAN is active)
+                    landmarks_68 = None
+                    if self.aligner is not None:
+                        landmarks_68 = self.aligner.get_landmarks(face_roi)
+
+                    # No tracking context — assume temporal consistency met
+                    self._maybe_learn(
+                        name, embedding, best_match[1],
+                        face_roi, face_w, face_h,
+                        landmarks_68, MIN_TRACK_FRAMES,
+                    )
 
                 results.append({
                     "location": face_data["box"],
@@ -359,7 +483,7 @@ class FaceRecognizer:
         return frame[py1:py2, px1:px2]
 
     def _extract_embedding(
-        self, face_image: np.ndarray, align: bool = True
+        self, face_image: np.ndarray
     ) -> Optional[np.ndarray]:
         """
         Extract face embedding using DeepFace.
@@ -394,7 +518,7 @@ class FaceRecognizer:
                 result = DeepFace.represent(
                     img_path=face_image,
                     model_name=self.model_name,
-                    enforce_detection=align,
+                    enforce_detection=False,
                 )
 
             else:

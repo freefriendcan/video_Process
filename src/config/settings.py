@@ -35,6 +35,17 @@ class DetectionConfig(BaseModel):
     max_detections: int = Field(default=10, ge=1)
 
 
+class QualityGateConfig(BaseModel):
+    """Quality gate configuration for incremental learning."""
+
+    enabled: bool = True
+    min_face_size: int = Field(default=80, ge=1)
+    min_laplacian_var: int = Field(default=80, ge=0)
+    max_pose_angle: float = Field(default=15.0, ge=0.0, le=90.0)
+    min_track_frames: int = Field(default=3, ge=1)
+    learn_interval_frames: int = Field(default=30, ge=1)
+
+
 class FaceRecognitionConfig(BaseModel):
     """Face recognition configuration."""
 
@@ -44,6 +55,7 @@ class FaceRecognitionConfig(BaseModel):
     database_path: str = "data/embeddings/faces.pkl"
     detector_model: str = "yolov8n-face.pt"
     alignment_backend: Literal["fan", "deepface", "none"] = "fan"
+    quality_gate: QualityGateConfig = Field(default_factory=QualityGateConfig)
 
 
 class FallDetectionConfig(BaseModel):

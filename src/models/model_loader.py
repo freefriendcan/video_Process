@@ -2,7 +2,7 @@
 
 import hashlib
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, List
 from urllib.request import urlretrieve
 
 from loguru import logger
@@ -23,9 +23,6 @@ class ModelLoader:
         "yolov10n.pt": "https://github.com/THU-MIG/yolov10/releases/download/v1.1/yolov10n.pt",
         "yolov10s.pt": "https://github.com/THU-MIG/yolov10/releases/download/v1.1/yolov10s.pt",
     }
-
-    # YOLOv8-face (from third-party repo)
-    FACE_MODEL_URL = "https://github.com/akanametov/yolov8-face/releases/download/v0.0.1/yolov8n-face.pt"
 
     def __init__(self, models_dir: Optional[Union[str, Path]] = None):
         """
@@ -70,7 +67,8 @@ class ModelLoader:
         if model_name in self.MODEL_URLS:
             url = self.MODEL_URLS[model_name]
         elif "face" in model_name:
-            url = self.FACE_MODEL_URL
+            # We rely on the pre-downloaded derronqi model in data/models
+            raise ValueError(f"Face model '{model_name}' must be manually downloaded to {model_path}")
         else:
             raise ValueError(f"Unknown model: {model_name}")
 
@@ -117,7 +115,7 @@ class ModelLoader:
 
         return True
 
-    def list_models(self) -> list[dict]:
+    def list_models(self) -> List[dict]:
         """
         List all available models.
 
@@ -178,6 +176,6 @@ class ModelLoader:
         return None
 
 
-def list_available_models() -> list[str]:
+def list_available_models() -> List[str]:
     """Get list of all available model names."""
     return list(ModelLoader.MODEL_URLS.keys()) + ["yolov8n-face.pt"]

@@ -180,3 +180,66 @@ class FaceAligner:
             borderMode=cv2.BORDER_REPLICATE,
         )
         return aligned
+
+    @staticmethod
+    def estimate_pose(landmarks_68: np.ndarray) -> tuple[float, float, float]:
+        """Estimate head pose (yaw, pitch, roll) from 68 facial landmarks.
+
+        Uses cv2.solvePnP with a standard 3D face model.
+
+        Returns:
+            (yaw, pitch, roll) in degrees
+        """
+        # 3D face model: 6 key points
+        model_points = np.array([
+            (0.0, 0.0, 0.0),             # Nose tip
+            (0.0, -330.0, -65.0),         # Chin
+            (-225.0, 170.0, -135.0),      # Left eye outer corner
+            (225.0, 170.0, -135.0),       # Right eye outer corner
+            (-150.0, -150.0, -125.0),     # Left mouth corner
+            (150.0, -150.0, -125.0),      # Right mouth corner
+        ])
+
+        # Corresponding 2D points from 68 landmarks
+        image_points = np.array([
+            landmarks_68[30],  # Nose tip
+            landmarks_68[8],   # Chin
+            landmarks_68[36],  # Left eye outer corner
+            landmarks_68[45],  # Right eye outer corner
+            landmarks_68[48],  # Left mouth corner
+            landmarks_68[54],  # Right mouth corner
+        ], dtype=np.float32)
+
+        # Camera intrinsics (approximate for 112x112 aligned face)
+        focal_length = 450
+        center = (112, 112)
+        camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1],
+        ], dtype=np.float32)
+
+        dist_coeffs = np.zeros((4, 1))
+
+        success, rotation_vector, _ = cv2.solvePnP(
+            model_points, image_points, camera_matrix, dist_coeffs,
+        )
+        if not success:
+            return (0.0, 0.0, 0.0)
+
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+
+        # Extract Euler angles
+        sy = np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)
+        singular = sy < 1e-6
+
+        if not singular:
+            roll = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+            pitch = np.arctan2(-rotation_matrix[2, 0], sy)
+            yaw = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+        else:
+            roll = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
+            pitch = np.arctan2(-rotation_matrix[2, 0], sy)
+            yaw = 0.0
+
+        return (np.degrees(yaw), np.degrees(pitch), np.degrees(roll))

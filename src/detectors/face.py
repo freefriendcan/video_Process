@@ -1,6 +1,6 @@
 """Face detection using YOLOv8-face."""
 
-from typing import Any
+from typing import Any, List
 
 import numpy as np
 
@@ -100,7 +100,7 @@ class FaceDetector(BaseDetector):
             "keypoints": [],
         }
 
-    def extract_face_roi(self, frame: np.ndarray, padding: int = 20) -> list[np.ndarray]:
+    def extract_face_roi(self, frame: np.ndarray, padding: int = 20) -> List[np.ndarray]:
         """
         Extract face regions of interest from frame.
 

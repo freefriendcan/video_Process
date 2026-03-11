@@ -30,6 +30,15 @@ face_recognition:
   detector_model: "yolov8n-face.pt"  # From derronqi/yolov8-face repo
   alignment_backend: "fan"           # fan (FAN 68-landmark), deepface (legacy Haar), none
 
+  # Quality Gate for incremental learning
+  quality_gate:
+    enabled: true
+    min_face_size: 80              # Min face px for learning (vs 40 for recognition)
+    min_laplacian_var: 80          # Blur threshold (lower = blurry)
+    max_pose_angle: 15.0           # Max yaw/pitch degrees
+    min_track_frames: 3            # Min tracked frames before learning
+    learn_interval_frames: 30      # Re-evaluate learning every N tracked frames
+
 fall_detection:
   enabled: true
   aspect_ratio_threshold: 2.5  # width/height for fallen person
@@ -50,7 +59,7 @@ alerts:
   screenshot_path: "data/logs/screenshots"
 
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR
   format: "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
   rotation: "10 MB"
   retention: "7 days"

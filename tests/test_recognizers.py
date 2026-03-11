@@ -116,6 +116,77 @@ class TestFaceRecognizer:
         assert recognizer.alignment_backend == "none"
         assert recognizer.aligner is None
 
+    def test_extract_padded_roi(self):
+        """Test that _extract_padded_roi applies correct padding."""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # Mark the full frame so we can verify crop bounds
+        frame[:] = 100
+
+        # Face at center: 200,150 -> 300,250 (100x100)
+        roi = FaceRecognizer._extract_padded_roi(frame, 200, 150, 300, 250)
+
+        # FACE_PADDING_RATIO=0.3 → pad_x=30, pad_y=30
+        # Expected: 170,120 -> 330,280 → 160x160
+        assert roi.shape[0] == 160  # height
+        assert roi.shape[1] == 160  # width
+
+    def test_extract_padded_roi_clamped(self):
+        """Test that padding is clamped to frame boundaries."""
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        roi = FaceRecognizer._extract_padded_roi(frame, 0, 0, 50, 50)
+
+        # pad=15 each side, but clamped at 0 → 0,0 -> 65,65
+        assert roi.shape[0] == 65
+        assert roi.shape[1] == 65
+
+    def test_register_face_with_frame_and_box(self, config, monkeypatch):
+        """Test register_face uses padded ROI when frame+box provided."""
+        recognizer = FaceRecognizer(config)
+
+        captured_rois = []
+
+        def mock_extract_embedding(self_inner, face_image):
+            captured_rois.append(face_image.shape)
+            return np.random.rand(512).astype(np.float32)
+
+        monkeypatch.setattr(FaceRecognizer, "_extract_embedding", mock_extract_embedding)
+
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        box = [200, 150, 300, 250]  # 100x100 face
+
+        result = recognizer.register_face(
+            face_image=frame[150:250, 200:300],
+            name="test",
+            frame=frame,
+            box=box,
+        )
+
+        assert result is True
+        assert "test" in recognizer.known_faces
+        # ROI should be padded (160x160), not raw (100x100)
+        assert captured_rois[0][0] == 160
+        assert captured_rois[0][1] == 160
+
+    def test_register_face_backward_compat(self, config, monkeypatch):
+        """Test register_face works without frame+box (backward compat)."""
+        recognizer = FaceRecognizer(config)
+
+        captured_rois = []
+
+        def mock_extract_embedding(self_inner, face_image):
+            captured_rois.append(face_image.shape)
+            return np.random.rand(512).astype(np.float32)
+
+        monkeypatch.setattr(FaceRecognizer, "_extract_embedding", mock_extract_embedding)
+
+        face_image = np.zeros((100, 100, 3), dtype=np.uint8)
+        result = recognizer.register_face(face_image, "test_legacy")
+
+        assert result is True
+        assert "test_legacy" in recognizer.known_faces
+        # ROI should be raw (100x100)
+        assert captured_rois[0] == (100, 100, 3)
+
 
 class TestFaceAligner:
     """Tests for FaceAligner."""
@@ -263,3 +334,88 @@ class TestHandGestureClasses:
         assert isinstance(gesture, BaseGesture)
         assert hasattr(gesture, "detect")
         assert hasattr(gesture, "name")
+
+
+class TestQualityGate:
+    """Tests for quality gate in incremental learning."""
+
+    def test_rejects_small_faces(self):
+        """Quality gate rejects faces below minimum size."""
+        from src.recognizers.face_recognizer import MIN_LEARN_FACE_SIZE
+
+        recognizer = FaceRecognizer(Config())
+        small_face = np.zeros((60, 60, 3), dtype=np.uint8)
+
+        passed, reason = recognizer._check_quality_gate(small_face, 60, 60, None, 5)
+
+        assert not passed
+        assert "too small" in reason
+        assert f"< {MIN_LEARN_FACE_SIZE}" in reason
+
+    def test_rejects_blurry(self):
+        """Quality gate rejects blurry faces."""
+        import cv2
+        from src.recognizers.face_recognizer import MIN_LAPLACIAN_VAR
+
+        recognizer = FaceRecognizer(Config())
+        blurry = cv2.GaussianBlur(
+            np.ones((100, 100, 3), dtype=np.uint8) * 128, (21, 21), 0,
+        )
+
+        passed, reason = recognizer._check_quality_gate(blurry, 100, 100, None, 5)
+
+        assert not passed
+        assert "blurry" in reason
+        assert f"< {MIN_LAPLACIAN_VAR}" in reason
+
+    def test_rejects_bad_pose(self):
+        """Quality gate rejects extreme head poses."""
+        from src.recognizers.face_recognizer import MAX_POSE_ANGLE
+
+        recognizer = FaceRecognizer(Config())
+
+        # Mock aligner to return extreme yaw
+        class _MockAligner:
+            @staticmethod
+            def estimate_pose(_lm):
+                return (45.0, 0.0, 0.0)
+
+        recognizer.aligner = _MockAligner()
+
+        landmarks_68 = np.zeros((68, 2), dtype=np.float32)
+        face_roi = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+
+        passed, reason = recognizer._check_quality_gate(
+            face_roi, 100, 100, landmarks_68, 5,
+        )
+
+        assert not passed
+        assert "bad pose" in reason
+        assert f"> {MAX_POSE_ANGLE}" in reason
+
+    def test_rejects_low_frame_count(self):
+        """Quality gate rejects faces not tracked long enough."""
+        from src.recognizers.face_recognizer import MIN_TRACK_FRAMES
+
+        recognizer = FaceRecognizer(Config())
+        sharp = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+
+        passed, reason = recognizer._check_quality_gate(sharp, 100, 100, None, 1)
+
+        assert not passed
+        assert "not tracked" in reason
+        assert f"< {MIN_TRACK_FRAMES}" in reason
+
+    def test_accepts_high_quality(self):
+        """Quality gate accepts faces meeting all criteria."""
+        from src.recognizers.face_recognizer import MIN_TRACK_FRAMES
+
+        recognizer = FaceRecognizer(Config())
+        high_quality = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+
+        passed, reason = recognizer._check_quality_gate(
+            high_quality, 100, 100, None, MIN_TRACK_FRAMES,
+        )
+
+        assert passed
+        assert reason == "quality gate passed"
