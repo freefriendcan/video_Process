@@ -153,9 +153,7 @@ def camera_processing_loop():
     async_image_buffer = []
 
     while True:
-        # FPS Limitini Koruyucu: OpenCV çok hızlı kare okuyup yüzleri bulanıklaştırmasın diye
-        # 20 FPS civarında donanımsal okuma hızı simülasyonu koyulmuştur.
-        time.sleep(0.05)
+        # FPS Limiti Kaldırıldı: Kullanıcı isteği üzerine kamera maksimum hızda çalışacak
         
         success, frame = camera.read()
         if not success:
