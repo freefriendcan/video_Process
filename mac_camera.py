@@ -115,17 +115,20 @@ MP_LANDMARK_MAP = {
 }
 
 if Path(FALL_MODEL_PATH).exists():
+    TFLiteInterpreter = None
     try:
-        import tflite_runtime.interpreter as tflite_mod
+        from ai_edge_litert.interpreter import Interpreter as TFLiteInterpreter
     except ImportError:
         try:
-            import tensorflow.lite as tflite_mod
+            from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
         except ImportError:
-            tflite_mod = None
-            print("[WARN] tflite_runtime / tensorflow not found. Fall detection disabled.")
+            try:
+                from tensorflow.lite import Interpreter as TFLiteInterpreter
+            except ImportError:
+                print("[WARN] No TFLite runtime found. Install: pip install ai-edge-litert")
 
-    if tflite_mod:
-        fall_interpreter = tflite_mod.Interpreter(model_path=FALL_MODEL_PATH)
+    if TFLiteInterpreter:
+        fall_interpreter = TFLiteInterpreter(model_path=FALL_MODEL_PATH)
         fall_interpreter.allocate_tensors()
         fall_input_details = fall_interpreter.get_input_details()
         fall_output_details = fall_interpreter.get_output_details()
@@ -580,8 +583,7 @@ def camera_processing_loop():
             cv2.putText(frame, f"Gesture: {latest_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
         # 2b. Fall Detection (Transformer + MediaPipe Pose)
-        fall_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        is_fall, fall_prob = run_fall_detection(fall_rgb)
+        is_fall, fall_prob = run_fall_detection(rgb_frame)
 
         # Draw fall detection status overlay
         if latest_fall_status == "FALL DETECTED":

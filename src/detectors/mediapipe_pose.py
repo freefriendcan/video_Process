@@ -104,6 +104,8 @@ class MediaPipePoseDetector:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._last_raw_results = None
+        self._last_detect_result = None
+        self._last_frame_id = None  # Hash to avoid re-processing same frame
 
     def detect(self, frame: np.ndarray) -> dict:
         """Run pose estimation on a BGR frame.
@@ -112,10 +114,21 @@ class MediaPipePoseDetector:
         - persons_found: bool
         - count: int (0 or 1 for MediaPipe)
         - poses: list of pose dicts with pixel-coord keypoints
+
+        Uses frame-level caching to avoid reprocessing the same frame
+        when called by both fall detector and gesture detector in the
+        same processing cycle.
         """
         if frame is None or frame.size == 0:
             self._last_raw_results = None
-            return self._empty_result()
+            self._last_detect_result = self._empty_result()
+            self._last_frame_id = None
+            return self._last_detect_result
+
+        # Frame-level cache: skip re-processing if same frame
+        frame_id = id(frame)
+        if frame_id == self._last_frame_id and self._last_detect_result is not None:
+            return self._last_detect_result
 
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -123,9 +136,11 @@ class MediaPipePoseDetector:
 
         results = self.pose.process(rgb)
         self._last_raw_results = results
+        self._last_frame_id = frame_id
 
         if not results.pose_landmarks:
-            return self._empty_result()
+            self._last_detect_result = self._empty_result()
+            return self._last_detect_result
 
         landmarks = results.pose_landmarks.landmark
 
@@ -156,11 +171,12 @@ class MediaPipePoseDetector:
             "bbox": bbox,
         }
 
-        return {
+        self._last_detect_result = {
             "persons_found": True,
             "count": 1,
             "poses": [pose],
         }
+        return self._last_detect_result
 
     def get_keypoints(
         self, frame: np.ndarray, person_idx: int = 0

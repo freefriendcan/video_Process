@@ -2,7 +2,8 @@
 ultralytics>=8.0.0
 opencv-python>=4.8.0
 torch>=2.0.0
-mediapipe>=0.10.0
+mediapipe==0.10.14
+ai-edge-litert>=2.1.0
 
 # Recognition
 deepface>=0.0.80

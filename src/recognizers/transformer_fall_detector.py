@@ -156,28 +156,21 @@ class TransformerFallDetector:
             return
 
         try:
-            import tflite_runtime.interpreter as tflite
+            from ai_edge_litert.interpreter import Interpreter as TFLiteInterpreter
         except ImportError:
             try:
-                import tensorflow.lite as tflite
+                from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
             except ImportError:
-                logger.warning(
-                    "Neither tflite_runtime nor tensorflow found. "
-                    "Attempting mediapipe's bundled tflite."
-                )
                 try:
-                    from mediapipe.python._framework_bindings import _pywrap_mediapipe  # noqa
-                    # Fallback: use tensorflow
-                    import tensorflow as tf
-                    tflite = tf.lite
+                    from tensorflow.lite import Interpreter as TFLiteInterpreter
                 except ImportError:
                     logger.error(
                         "Cannot load TFLite runtime. Install: "
-                        "pip install tflite-runtime"
+                        "pip install ai-edge-litert"
                     )
                     return
 
-        self._interpreter = tflite.Interpreter(
+        self._interpreter = TFLiteInterpreter(
             model_path=str(self.model_path)
         )
         self._interpreter.allocate_tensors()
