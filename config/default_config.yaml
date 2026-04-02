@@ -41,10 +41,21 @@ face_recognition:
 
 fall_detection:
   enabled: true
-  aspect_ratio_threshold: 2.5  # width/height for fallen person
-  min_frames_for_fall: 5       # Consecutive frames required
-  alert_cooldown: 30           # Seconds between fall alerts
-  pose_model: "yolov8n-pose.pt"
+  method: "transformer"              # "transformer" (ML) or "geometric" (legacy heuristic)
+
+  # Transformer method settings
+  transformer_model_path: "data/models/fall_detection_transformer.tflite"
+  input_timesteps: 30                # Frame sequence length for Transformer
+  transformer_confidence: 0.90       # Fall probability threshold
+  mediapipe_complexity: 1            # MediaPipe Pose model complexity (0=lite, 1=full, 2=heavy)
+
+  # Geometric method settings (legacy fallback)
+  aspect_ratio_threshold: 2.5       # width/height for fallen person
+  min_frames_for_fall: 5            # Consecutive frames required
+
+  # Shared settings
+  alert_cooldown: 10                 # Seconds between fall alerts
+  pose_model: "yolov8n-pose.pt"     # Used by geometric method only
 
 gesture_detection:
   enabled: true

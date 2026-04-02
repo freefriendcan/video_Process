@@ -19,6 +19,7 @@ from .detectors.face import FaceDetector
 from .detectors.pose import PoseDetector
 from .recognizers.face_recognizer import FaceRecognizer
 from .recognizers.fall_detector import FallDetector
+from .recognizers.transformer_fall_detector import TransformerFallDetector
 from .recognizers.gesture_detector import GestureDetector
 from .events.event import (
     create_face_recognized_event,
@@ -51,14 +52,33 @@ class SmartHomeProcessor:
         # Initialize detectors
         self.person_detector = PersonDetector(config) if config.person_detection.enabled else None
         self.face_detector = FaceDetector(config) if config.face_recognition.enabled else None
-        self.pose_detector = PoseDetector(config) if (
-            config.fall_detection.enabled or config.gesture_detection.enabled
-        ) else None
+
+        # Initialize fall detector (selects between transformer and geometric)
+        self.fall_detector = None
+        shared_mediapipe_pose = None
+        if config.fall_detection.enabled:
+            if config.fall_detection.method == "transformer":
+                self.fall_detector = TransformerFallDetector(config)
+                shared_mediapipe_pose = self.fall_detector.get_pose_detector()
+                logger.info("Using Transformer fall detection (MediaPipe Pose)")
+            else:
+                self.fall_detector = FallDetector(config)
+                logger.info("Using geometric fall detection (YOLOv8-pose)")
+
+        # Pose detector — share MediaPipe instance if available
+        self.pose_detector = None
+        if config.fall_detection.enabled or config.gesture_detection.enabled:
+            if shared_mediapipe_pose is None:
+                self.pose_detector = PoseDetector(config)
+            else:
+                self.pose_detector = shared_mediapipe_pose
 
         # Initialize recognizers
         self.face_recognizer = FaceRecognizer(config) if config.face_recognition.enabled else None
-        self.fall_detector = FallDetector(config) if config.fall_detection.enabled else None
-        self.gesture_detector = GestureDetector(config) if config.gesture_detection.enabled else None
+        self.gesture_detector = (
+            GestureDetector(config, pose_detector=shared_mediapipe_pose)
+            if config.gesture_detection.enabled else None
+        )
 
         # Initialize event handling
         event_logger = EventLogger(config.alerts.log_file)

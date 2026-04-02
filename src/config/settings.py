@@ -62,10 +62,21 @@ class FallDetectionConfig(BaseModel):
     """Fall detection configuration."""
 
     enabled: bool = True
+    method: Literal["transformer", "geometric"] = "transformer"
+
+    # Transformer method settings
+    transformer_model_path: str = "data/models/fall_detection_transformer.tflite"
+    input_timesteps: int = Field(default=30, ge=1)
+    transformer_confidence: float = Field(default=0.90, ge=0.0, le=1.0)
+    mediapipe_complexity: int = Field(default=1, ge=0, le=2)
+
+    # Geometric method settings (legacy)
     aspect_ratio_threshold: float = Field(default=2.5, ge=1.0)
     min_frames_for_fall: int = Field(default=5, ge=1)
-    alert_cooldown: int = Field(default=30, ge=0)  # Seconds
-    pose_model: str = "yolov8n-pose.pt"
+
+    # Shared
+    alert_cooldown: int = Field(default=10, ge=0)  # Seconds
+    pose_model: str = "yolov8n-pose.pt"  # Used by geometric method only
 
 
 class GestureDetectionConfig(BaseModel):

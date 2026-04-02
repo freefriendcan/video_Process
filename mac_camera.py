@@ -6,7 +6,9 @@ from mediapipe.tasks.python import vision
 from flask import Flask, Response
 import time
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import requests
 import os
 import urllib.request
@@ -33,6 +35,7 @@ camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 IDENTIFY_URL = "http://100.105.136.5:8000/vision/identify" 
 PRESENCE_URL = "http://100.105.136.5:8000/vision/update_presence"
+FALL_ALERT_URL = "http://100.105.136.5:8000/vision/fall_alert"
 
 MODEL_PATH = "blaze_face_short_range.tflite"
 
@@ -58,6 +61,214 @@ if not os.path.exists(GESTURE_MODEL_PATH):
 latest_gesture = ""
 latest_gesture_time = 0
 is_gesture_processing = False
+
+# === FALL DETECTION INIT (Transformer + MediaPipe Pose) ===
+FALL_MODEL_PATH = "data/models/fall_detection_transformer.tflite"
+FALL_INPUT_TIMESTEPS = 30     # Frames for temporal window
+FALL_CONFIDENCE_THRESHOLD = 0.90
+FALL_ALERT_COOLDOWN = 10      # Seconds between fall alerts
+
+# MediaPipe Pose for fall detection keypoint extraction
+mp_pose = mp.solutions.pose
+pose_detector = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    smooth_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+)
+
+# TFLite Transformer model
+fall_interpreter = None
+fall_input_details = None
+fall_output_details = None
+
+# Sorted keypoint names matching the model's training feature order
+SORT_KP_NAMES = sorted([
+    'Nose', 'Left Eye', 'Right Eye', 'Left Ear', 'Right Ear',
+    'Left Shoulder', 'Right Shoulder', 'Left Elbow', 'Right Elbow',
+    'Left Wrist', 'Right Wrist', 'Left Hip', 'Right Hip',
+    'Left Knee', 'Right Knee', 'Left Ankle', 'Right Ankle',
+])
+SKP_IDX = {n: i for i, n in enumerate(SORT_KP_NAMES)}
+NUM_FEAT = len(SORT_KP_NAMES) * 3  # 51
+
+# MediaPipe landmark → sorted keypoint name mapping
+MP_LANDMARK_MAP = {
+    mp_pose.PoseLandmark.NOSE: 'Nose',
+    mp_pose.PoseLandmark.LEFT_EYE: 'Left Eye',
+    mp_pose.PoseLandmark.RIGHT_EYE: 'Right Eye',
+    mp_pose.PoseLandmark.LEFT_EAR: 'Left Ear',
+    mp_pose.PoseLandmark.RIGHT_EAR: 'Right Ear',
+    mp_pose.PoseLandmark.LEFT_SHOULDER: 'Left Shoulder',
+    mp_pose.PoseLandmark.RIGHT_SHOULDER: 'Right Shoulder',
+    mp_pose.PoseLandmark.LEFT_ELBOW: 'Left Elbow',
+    mp_pose.PoseLandmark.RIGHT_ELBOW: 'Right Elbow',
+    mp_pose.PoseLandmark.LEFT_WRIST: 'Left Wrist',
+    mp_pose.PoseLandmark.RIGHT_WRIST: 'Right Wrist',
+    mp_pose.PoseLandmark.LEFT_HIP: 'Left Hip',
+    mp_pose.PoseLandmark.RIGHT_HIP: 'Right Hip',
+    mp_pose.PoseLandmark.LEFT_KNEE: 'Left Knee',
+    mp_pose.PoseLandmark.RIGHT_KNEE: 'Right Knee',
+    mp_pose.PoseLandmark.LEFT_ANKLE: 'Left Ankle',
+    mp_pose.PoseLandmark.RIGHT_ANKLE: 'Right Ankle',
+}
+
+if Path(FALL_MODEL_PATH).exists():
+    try:
+        import tflite_runtime.interpreter as tflite_mod
+    except ImportError:
+        try:
+            import tensorflow.lite as tflite_mod
+        except ImportError:
+            tflite_mod = None
+            print("[WARN] tflite_runtime / tensorflow not found. Fall detection disabled.")
+
+    if tflite_mod:
+        fall_interpreter = tflite_mod.Interpreter(model_path=FALL_MODEL_PATH)
+        fall_interpreter.allocate_tensors()
+        fall_input_details = fall_interpreter.get_input_details()
+        fall_output_details = fall_interpreter.get_output_details()
+        print(f"[FALL] Transformer model loaded: {FALL_MODEL_PATH} (input: {fall_input_details[0]['shape']})")
+else:
+    print(f"[WARN] Fall model not found at {FALL_MODEL_PATH}. Fall detection disabled.")
+
+# Fall detection state
+fall_feature_buffer = deque(maxlen=FALL_INPUT_TIMESTEPS)
+last_fall_alert_time = 0.0
+latest_fall_status = ""  # For overlay
+latest_fall_confidence = 0.0
+
+
+def _kp_idx(name):
+    """Get (x, y, vis) indices in the flat feature vector."""
+    i = SKP_IDX[name]
+    return i * 3, i * 3 + 1, i * 3 + 2
+
+
+def extract_and_normalize_pose(rgb_frame):
+    """Extract MediaPipe Pose keypoints, normalize (hip-centered, torso-scaled).
+    Returns 51-dim feature vector or None."""
+    results = pose_detector.process(rgb_frame)
+    if not results.pose_landmarks:
+        return None
+
+    landmarks = results.pose_landmarks.landmark
+    features = np.zeros(NUM_FEAT, dtype=np.float32)
+
+    for mp_enum, kp_name in MP_LANDMARK_MAP.items():
+        idx = SKP_IDX[kp_name]
+        lm = landmarks[mp_enum.value]
+        features[idx * 3] = lm.x
+        features[idx * 3 + 1] = lm.y
+        features[idx * 3 + 2] = lm.visibility
+
+    # Normalize: hip-centered + torso-scaled
+    ls_x, ls_y, ls_c = _kp_idx('Left Shoulder')
+    rs_x, rs_y, rs_c = _kp_idx('Right Shoulder')
+    lh_x, lh_y, lh_c = _kp_idx('Left Hip')
+    rh_x, rh_y, rh_c = _kp_idx('Right Hip')
+
+    # Mid-hip (origin)
+    valid_lh = features[lh_c] > 0.3
+    valid_rh = features[rh_c] > 0.3
+    if valid_lh and valid_rh:
+        hip_x = (features[lh_x] + features[rh_x]) / 2
+        hip_y = (features[lh_y] + features[rh_y]) / 2
+    elif valid_lh:
+        hip_x, hip_y = features[lh_x], features[lh_y]
+    elif valid_rh:
+        hip_x, hip_y = features[rh_x], features[rh_y]
+    else:
+        return features  # Can't normalize
+
+    # Mid-shoulder for torso height
+    valid_ls = features[ls_c] > 0.3
+    valid_rs = features[rs_c] > 0.3
+    if valid_ls and valid_rs:
+        sh_y = (features[ls_y] + features[rs_y]) / 2
+    elif valid_ls:
+        sh_y = features[ls_y]
+    elif valid_rs:
+        sh_y = features[rs_y]
+    else:
+        sh_y = None
+
+    torso_h = abs(sh_y - hip_y) if sh_y is not None else None
+    can_scale = torso_h is not None and torso_h > 1e-5
+
+    normalized = features.copy()
+    for kp_name in SORT_KP_NAMES:
+        xi, yi, _ = _kp_idx(kp_name)
+        normalized[xi] -= hip_x
+        normalized[yi] -= hip_y
+        if can_scale:
+            normalized[xi] /= torso_h
+            normalized[yi] /= torso_h
+
+    return normalized
+
+
+def run_fall_detection(rgb_frame):
+    """Run the full fall detection pipeline on one frame.
+    Returns (is_fall, confidence)."""
+    global last_fall_alert_time, latest_fall_status, latest_fall_confidence
+
+    if fall_interpreter is None:
+        return False, 0.0
+
+    features = extract_and_normalize_pose(rgb_frame)
+    if features is not None:
+        fall_feature_buffer.append(features)
+    else:
+        fall_feature_buffer.append(np.zeros(NUM_FEAT, dtype=np.float32))
+
+    if len(fall_feature_buffer) < FALL_INPUT_TIMESTEPS:
+        latest_fall_status = f"Buffering ({len(fall_feature_buffer)}/{FALL_INPUT_TIMESTEPS})"
+        latest_fall_confidence = 0.0
+        return False, 0.0
+
+    # TFLite inference
+    model_input = np.array(fall_feature_buffer, dtype=np.float32)[np.newaxis, ...]
+    try:
+        fall_interpreter.set_tensor(fall_input_details[0]['index'], model_input)
+        fall_interpreter.invoke()
+        output = fall_interpreter.get_tensor(fall_output_details[0]['index'])
+        fall_prob = float(output[0][0])
+    except Exception as e:
+        print(f"[FALL] Inference error: {e}")
+        return False, 0.0
+
+    is_fall = fall_prob >= FALL_CONFIDENCE_THRESHOLD
+    latest_fall_confidence = fall_prob
+
+    if is_fall:
+        latest_fall_status = "FALL DETECTED"
+        now = time.time()
+        if (now - last_fall_alert_time) > FALL_ALERT_COOLDOWN:
+            last_fall_alert_time = now
+            print(f"🚨 FALL DETECTED! Probability: {fall_prob:.2%}")
+            network_executor.submit(send_fall_alert, fall_prob)
+            return True, fall_prob
+    else:
+        latest_fall_status = "Standing"
+
+    return False, fall_prob
+
+
+def send_fall_alert(confidence):
+    """Send fall alert to Pi backend."""
+    try:
+        payload = {
+            "event": "fall_detected",
+            "confidence": round(confidence, 4),
+            "timestamp": time.time(),
+            "source": "mac_camera",
+        }
+        resp = requests.post(FALL_ALERT_URL, json=payload, timeout=3.0)
+        print(f"[FALL] Alert sent to backend: {resp.status_code}")
+    except Exception as e:
+        print(f"[FALL] Alert send error: {e}")
 
 def gesture_callback(result, output_image: mp.Image, timestamp_ms: int):
     global latest_gesture, latest_gesture_time, is_gesture_processing
@@ -368,6 +579,18 @@ def camera_processing_loop():
         if latest_gesture:
             cv2.putText(frame, f"Gesture: {latest_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
+        # 2b. Fall Detection (Transformer + MediaPipe Pose)
+        fall_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        is_fall, fall_prob = run_fall_detection(fall_rgb)
+
+        # Draw fall detection status overlay
+        if latest_fall_status == "FALL DETECTED":
+            cv2.putText(frame, f"FALL DETECTED ({fall_prob:.0%})", (20, frame_h - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+        elif latest_fall_status and latest_fall_status != "Standing":
+            cv2.putText(frame, latest_fall_status, (20, frame_h - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
         # 3. Synchronous Face Detection (every 0.15s for high-speed anti-drift)
         if current_time - last_detection_time > 0.15:
             # Use another independent mp.Image wrapper
@@ -479,7 +702,7 @@ def index():
     <html>
       <head><title>Mac Camera Stream</title></head>
       <body style="background-color:#121212; color:white; text-align:center; font-family:sans-serif;">
-        <h2>Live Camera Feed (Face & Gesture)</h2>
+        <h2>Live Camera Feed (Face, Gesture & Fall Detection)</h2>
         <img src="/video_feed" style="border:2px solid #333; border-radius:10px; box-shadow: 0px 0px 20px #000;" />
       </body>
     </html>

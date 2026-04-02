@@ -180,18 +180,24 @@ class GestureDetector:
         CrouchingGesture,
     ]
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, pose_detector=None):
         """
         Initialize gesture detector.
 
         Args:
             config: Configuration object
+            pose_detector: Optional shared pose detector instance
+                           (MediaPipePoseDetector or PoseDetector).
+                           If None, creates a new YOLOv8 PoseDetector.
         """
         self.config = config
         self.gesture_config = config.gesture_detection
 
-        # Initialize pose detector
-        self.pose_detector = PoseDetector(config, model_name=self.gesture_config.pose_model)
+        # Use shared pose detector or create a new YOLO one
+        if pose_detector is not None:
+            self.pose_detector = pose_detector
+        else:
+            self.pose_detector = PoseDetector(config, model_name=self.gesture_config.pose_model)
 
         # Gesture instances
         self.gestures = [cls() for cls in self.DEFAULT_GESTURES]
