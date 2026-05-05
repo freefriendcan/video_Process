@@ -157,7 +157,7 @@ if Path(FALL_MODEL_PATH).exists():
         fall_output_details = fall_interpreter.get_output_details()
         print(f"[FALL] Transformer model loaded: {FALL_MODEL_PATH} (input: {fall_input_details[0]['shape']})")
 else:
-    print(f"[WARN] Fall model not found at {FALL_MODEL_PATH}. Geometric fallback will activate.")
+    print(f"[FATAL] Fall model not found at {FALL_MODEL_PATH}. Fall detection disabled.")
 
 # Fall detection state
 fall_feature_buffer = deque(maxlen=FALL_INPUT_TIMESTEPS)
@@ -169,106 +169,10 @@ latest_fall_confidence = 0.0
 velocity_y_buffer = deque(maxlen=VELOCITY_WINDOW + 1)
 
 
-# === GEOMETRIC FALLBACK DETECTOR ===
-class GeometricFallbackDetector:
-    """Lightweight pose-based geometric fall detection.
-    Active only when TFLite Transformer model fails to load."""
-
-    ASPECT_RATIO_THRESHOLD = 2.5
-    BODY_ORIENTATION_THRESHOLD = 0.5
-    MIN_FRAMES_FOR_FALL = 5
-
-    def __init__(self):
-        self._fall_counter = 0
-
-    def detect(self, rgb_frame):
-        """Geometric fall detection using MediaPipe Pose landmarks.
-        Returns (is_fall_alert, confidence)."""
-        global latest_fall_status, latest_fall_confidence, last_fall_alert_time
-
-        results = pose_detector.process(rgb_frame)
-        if not results.pose_landmarks:
-            self._fall_counter = 0
-            latest_fall_status = "No pose"
-            latest_fall_confidence = 0.0
-            return False, 0.0
-
-        landmarks = results.pose_landmarks.landmark
-        visible_pts = [(lm.x, lm.y) for lm in landmarks if lm.visibility > 0.5]
-
-        if len(visible_pts) < 5:
-            self._fall_counter = 0
-            latest_fall_status = "Low visibility"
-            latest_fall_confidence = 0.0
-            return False, 0.0
-
-        xs = [p[0] for p in visible_pts]
-        ys = [p[1] for p in visible_pts]
-        width = max(xs) - min(xs)
-        height = max(ys) - min(ys)
-
-        if height < 1e-5:
-            return False, 0.0
-
-        aspect_ratio = width / height
-
-        # Body orientation from shoulder-hip torso vector
-        mp_lm = mp_pose.PoseLandmark
-        sh_l, sh_r = landmarks[mp_lm.LEFT_SHOULDER.value], landmarks[mp_lm.RIGHT_SHOULDER.value]
-        hp_l, hp_r = landmarks[mp_lm.LEFT_HIP.value], landmarks[mp_lm.RIGHT_HIP.value]
-
-        body_orientation = 1.0  # Default: vertical (standing)
-        if (sh_l.visibility > 0.3 or sh_r.visibility > 0.3) and \
-           (hp_l.visibility > 0.3 or hp_r.visibility > 0.3):
-            sh_cx = (sh_l.x + sh_r.x) / 2
-            sh_cy = (sh_l.y + sh_r.y) / 2
-            hp_cx = (hp_l.x + hp_r.x) / 2
-            hp_cy = (hp_l.y + hp_r.y) / 2
-            dx, dy = abs(hp_cx - sh_cx), abs(hp_cy - sh_cy)
-            if dx + dy > 0:
-                body_orientation = dy / (dx + dy)
-
-        # State machine
-        is_fallen = (
-            aspect_ratio >= self.ASPECT_RATIO_THRESHOLD
-            and body_orientation < self.BODY_ORIENTATION_THRESHOLD
-        )
-
-        if is_fallen:
-            self._fall_counter += 1
-        else:
-            self._fall_counter = max(0, self._fall_counter - 1)
-
-        if self._fall_counter >= self.MIN_FRAMES_FOR_FALL:
-            confidence = min(1.0, self._fall_counter / (self.MIN_FRAMES_FOR_FALL * 2))
-            latest_fall_status = "FALL DETECTED"
-            latest_fall_confidence = confidence
-            now = time.time()
-            if (now - last_fall_alert_time) > FALL_ALERT_COOLDOWN:
-                last_fall_alert_time = now
-                print(f"\U0001f6a8 [GEOMETRIC] FALL DETECTED! Confidence: {confidence:.2%}")
-                return True, confidence
-        elif self._fall_counter > 0:
-            latest_fall_status = f"Suspicious ({self._fall_counter}/{self.MIN_FRAMES_FOR_FALL})"
-            latest_fall_confidence = 0.0
-        else:
-            latest_fall_status = "Standing"
-            latest_fall_confidence = 0.0
-
-        return False, 0.0
-
-
-# Fallback initialization
-geometric_fallback = None
-active_fall_method = "geometric"  # Safe default, overwritten below
-
 if fall_interpreter is not None:
-    active_fall_method = "transformer"
     print("[FALL] \u2705 Active method: Transformer (TFLite)")
 else:
-    geometric_fallback = GeometricFallbackDetector()
-    active_fall_method = "geometric"
-    print("[FALL] \u26a0\ufe0f Active method: Geometric fallback (Transformer unavailable)")
+    print("[FALL] \u274c Transformer model unavailable. Fall detection is DISABLED.")
 
 
 def _kp_idx(name):
@@ -371,14 +275,9 @@ def extract_and_normalize_pose(rgb_frame):
 
 
 def run_fall_detection(rgb_frame):
-    """Run the full fall detection pipeline on one frame.
-    Dispatches to Transformer or Geometric method based on availability.
+    """Run the Transformer-based fall detection pipeline on one frame.
     Returns (is_fall_alert, confidence). Alert sending is handled by the caller."""
     global last_fall_alert_time, latest_fall_status, latest_fall_confidence
-
-    # Geometric fallback path
-    if active_fall_method == "geometric" and geometric_fallback is not None:
-        return geometric_fallback.detect(rgb_frame)
 
     # Transformer path
     if fall_interpreter is None:
@@ -458,7 +357,7 @@ def send_fall_alert(confidence, screenshot_path=None):
             "confidence": round(confidence, 4),
             "timestamp": time.time(),
             "source": "mac_camera",
-            "method": active_fall_method,
+            "method": "transformer",
         }
 
         if screenshot_path and Path(screenshot_path).exists():
