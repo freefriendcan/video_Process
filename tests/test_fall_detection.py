@@ -439,3 +439,93 @@ class TestFrameSkipping:
 
         assert real_frames == 30
         assert real_seconds == pytest.approx(1.0)
+
+
+# ═══════════════════════════════════════════════════════════
+# Velocity Filter Tests (Stage 1)
+# ═══════════════════════════════════════════════════════════
+
+class TestVelocityFilter:
+    """Tests for the velocity-based false positive filter.
+
+    Mirrors the compute_body_velocity() logic from mac_camera.py.
+    Velocity = average frame-to-frame Y change over a sliding window.
+    Positive velocity = downward movement (image coords: y increases downward).
+    """
+
+    VELOCITY_WINDOW = 5
+    MIN_FALL_VELOCITY = 0.025
+
+    @staticmethod
+    def _compute_velocity(y_buffer):
+        """Local replica of compute_body_velocity() for unit testing."""
+        if len(y_buffer) < 2:
+            return 0.0
+        buf = list(y_buffer)
+        velocities = [buf[i] - buf[i - 1] for i in range(1, len(buf))]
+        return sum(velocities) / len(velocities)
+
+    def test_real_fall_passes_threshold(self):
+        """Rapid downward motion (fall) produces velocity above threshold."""
+        # Simulating: body center drops from y=0.30 to y=0.75 in 5 frames
+        buf = deque([0.30, 0.39, 0.48, 0.60, 0.70, 0.75], maxlen=6)
+        velocity = self._compute_velocity(buf)
+
+        assert velocity >= self.MIN_FALL_VELOCITY, \
+            f"Fall velocity {velocity:.4f} should be >= {self.MIN_FALL_VELOCITY}"
+
+    def test_slow_sit_filtered(self):
+        """Slow sitting motion produces velocity below threshold."""
+        # Simulating: body center drops from y=0.40 to y=0.46 in 5 frames
+        buf = deque([0.40, 0.41, 0.42, 0.43, 0.44, 0.46], maxlen=6)
+        velocity = self._compute_velocity(buf)
+
+        assert velocity < self.MIN_FALL_VELOCITY, \
+            f"Sitting velocity {velocity:.4f} should be < {self.MIN_FALL_VELOCITY}"
+
+    def test_bending_filtered(self):
+        """Bending to pick something up: moderate speed, still below threshold."""
+        buf = deque([0.35, 0.36, 0.38, 0.40, 0.42, 0.44], maxlen=6)
+        velocity = self._compute_velocity(buf)
+
+        assert velocity < self.MIN_FALL_VELOCITY, \
+            f"Bending velocity {velocity:.4f} should be < {self.MIN_FALL_VELOCITY}"
+
+    def test_standing_still_near_zero(self):
+        """Person standing still: velocity ≈ 0."""
+        buf = deque([0.45, 0.45, 0.451, 0.449, 0.45, 0.45], maxlen=6)
+        velocity = self._compute_velocity(buf)
+
+        assert abs(velocity) < 0.005, \
+            f"Stationary velocity {velocity:.4f} should be near zero"
+
+    def test_empty_buffer_returns_zero(self):
+        """Empty or single-element buffer returns 0.0 safely."""
+        assert self._compute_velocity(deque()) == 0.0
+        assert self._compute_velocity(deque([0.5])) == 0.0
+
+    def test_upward_motion_negative(self):
+        """Person standing up: velocity is negative (upward movement)."""
+        buf = deque([0.70, 0.65, 0.58, 0.50, 0.42, 0.35], maxlen=6)
+        velocity = self._compute_velocity(buf)
+
+        assert velocity < 0, f"Upward velocity {velocity:.4f} should be negative"
+        assert velocity < -self.MIN_FALL_VELOCITY, "Getting up should be clearly negative"
+
+    def test_velocity_direction_matters(self):
+        """Only downward (positive) velocity should pass the fall gate."""
+        # Downward → positive
+        down_buf = deque([0.3, 0.4, 0.5, 0.6, 0.7, 0.8], maxlen=6)
+        # Upward → negative
+        up_buf = deque([0.8, 0.7, 0.6, 0.5, 0.4, 0.3], maxlen=6)
+
+        assert self._compute_velocity(down_buf) > 0
+        assert self._compute_velocity(up_buf) < 0
+
+    def test_partial_buffer_still_computes(self):
+        """Buffer with only 2 elements still produces valid velocity."""
+        buf = deque([0.30, 0.60], maxlen=6)
+        velocity = self._compute_velocity(buf)
+
+        assert velocity == pytest.approx(0.30)
+        assert velocity >= self.MIN_FALL_VELOCITY

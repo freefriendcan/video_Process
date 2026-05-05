@@ -36,6 +36,7 @@ camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 IDENTIFY_URL = "http://100.105.136.5:8000/vision/identify" 
 PRESENCE_URL = "http://100.105.136.5:8000/vision/update_presence"
 FALL_ALERT_URL = "http://100.105.136.5:8000/vision/fall_alert"
+GESTURE_URL = "http://100.105.136.5:8000/vision/gesture"
 
 MODEL_PATH = "blaze_face_short_range.tflite"
 
@@ -62,6 +63,15 @@ latest_gesture = ""
 latest_gesture_time = 0
 is_gesture_processing = False
 
+current_sustained_gesture = ""
+gesture_start_time = 0.0
+
+last_sent_gesture = ""
+last_sent_gesture_time = 0
+GESTURE_COOLDOWN = 1.0
+
+current_face_is_frontal = False
+
 # === FALL DETECTION INIT (Transformer + MediaPipe Pose) ===
 FALL_MODEL_PATH = "data/models/fall_detection_transformer.tflite"
 FALL_INPUT_TIMESTEPS = 30     # Frames for temporal window
@@ -71,9 +81,15 @@ FALL_ALERT_COOLDOWN = 10      # Seconds between fall alerts
 # With INTERVAL=2 at 30fps, the 30-sample buffer spans ~2 seconds (60 real frames)
 # instead of ~1 second. This is acceptable for fall detection since falls typically
 # take 0.5-2s, but be aware the model was trained on consecutive frames.
-FALL_DETECTION_INTERVAL = 2   # Run fall detection every N frames (Pi optimization)
+#  Run fall detection every N frames (Pi optimization)
+TARGET_FALL_FPS = 15  # Modelin eğitildiği optimum hız (genelde 15 FPS)
+FALL_FRAME_TIME = 1.0 / TARGET_FALL_FPS  # Yaklaşık 0.066 saniyede bir çalışacak
 SCREENSHOT_DIR = Path("data/logs/screenshots")
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# === VELOCITY FILTER (Stage 1: False positive reduction) ===
+VELOCITY_WINDOW = 5           # Frames over which to compute avg velocity
+MIN_FALL_VELOCITY = 0.025     # Min downward y-change per frame to qualify as a fall
 
 # MediaPipe Pose for fall detection keypoint extraction
 mp_pose = mp.solutions.pose
@@ -148,6 +164,9 @@ fall_feature_buffer = deque(maxlen=FALL_INPUT_TIMESTEPS)
 last_fall_alert_time = 0.0
 latest_fall_status = ""  # For overlay
 latest_fall_confidence = 0.0
+
+# Velocity tracking — raw (pre-normalization) body center Y positions
+velocity_y_buffer = deque(maxlen=VELOCITY_WINDOW + 1)
 
 
 # === GEOMETRIC FALLBACK DETECTOR ===
@@ -258,9 +277,24 @@ def _kp_idx(name):
     return i * 3, i * 3 + 1, i * 3 + 2
 
 
+def compute_body_velocity():
+    """Average downward velocity from recent shoulder/hip Y positions.
+
+    Positive = moving down (y increases downward in image coordinates).
+    Used by the velocity gate to reject slow movements (sitting, bending).
+    """
+    if len(velocity_y_buffer) < 2:
+        return 0.0
+
+    buf = list(velocity_y_buffer)
+    velocities = [buf[i] - buf[i - 1] for i in range(1, len(buf))]
+    return sum(velocities) / len(velocities)
+
+
 def extract_and_normalize_pose(rgb_frame):
     """Extract MediaPipe Pose keypoints, normalize (hip-centered, torso-scaled).
-    Returns 51-dim feature vector or None."""
+    Returns 51-dim feature vector or None.
+    Side-effect: feeds velocity_y_buffer with raw body-center Y."""
     results = pose_detector.process(rgb_frame)
     if not results.pose_landmarks:
         return None
@@ -274,6 +308,21 @@ def extract_and_normalize_pose(rgb_frame):
         features[idx * 3] = lm.x
         features[idx * 3 + 1] = lm.y
         features[idx * 3 + 2] = lm.visibility
+
+    # Feed velocity buffer with raw body-center Y (BEFORE normalization)
+    _ls_x, _ls_y, _ls_c = _kp_idx('Left Shoulder')
+    _rs_x, _rs_y, _rs_c = _kp_idx('Right Shoulder')
+    _lh_x, _lh_y, _lh_c = _kp_idx('Left Hip')
+    _rh_x, _rh_y, _rh_c = _kp_idx('Right Hip')
+
+    body_y_pts = []
+    if features[_ls_c] > 0.3: body_y_pts.append(features[_ls_y])
+    if features[_rs_c] > 0.3: body_y_pts.append(features[_rs_y])
+    if features[_lh_c] > 0.3: body_y_pts.append(features[_lh_y])
+    if features[_rh_c] > 0.3: body_y_pts.append(features[_rh_y])
+
+    if body_y_pts:
+        velocity_y_buffer.append(sum(body_y_pts) / len(body_y_pts))
 
     # Normalize: hip-centered + torso-scaled
     ls_x, ls_y, ls_c = _kp_idx('Left Shoulder')
@@ -338,7 +387,11 @@ def run_fall_detection(rgb_frame):
     features = extract_and_normalize_pose(rgb_frame)
     if features is not None:
         fall_feature_buffer.append(features)
+    elif len(fall_feature_buffer) > 0:
+        # Kişi düştüğü için landmark kaybolduysa, son pozu kopyala
+        fall_feature_buffer.append(fall_feature_buffer[-1]) 
     else:
+        # Ekranda en başından beri kimse yoksa
         fall_feature_buffer.append(np.zeros(NUM_FEAT, dtype=np.float32))
 
     if len(fall_feature_buffer) < FALL_INPUT_TIMESTEPS:
@@ -361,11 +414,19 @@ def run_fall_detection(rgb_frame):
     latest_fall_confidence = fall_prob
 
     if is_fall:
+        # Stage 1: Velocity gate — reject slow movements
+        body_velocity = compute_body_velocity()
+        if body_velocity < MIN_FALL_VELOCITY:
+            latest_fall_status = f"Slow motion (v={body_velocity:.4f})"
+            print(f"[FALL] ❌ Velocity too low ({body_velocity:.4f} < {MIN_FALL_VELOCITY}). "
+                  f"Likely sitting/bending. prob={fall_prob:.2%}")
+            return False, fall_prob
+
         latest_fall_status = "FALL DETECTED"
         now = time.time()
         if (now - last_fall_alert_time) > FALL_ALERT_COOLDOWN:
             last_fall_alert_time = now
-            print(f"🚨 FALL DETECTED! Probability: {fall_prob:.2%}")
+            print(f"🚨 FALL DETECTED! Probability: {fall_prob:.2%} (velocity: {body_velocity:.4f})")
             return True, fall_prob
     else:
         latest_fall_status = "Standing"
@@ -412,15 +473,62 @@ def send_fall_alert(confidence, screenshot_path=None):
     except Exception as e:
         print(f"[FALL] Alert send error: {e}")
 
+def send_gesture_event(gesture_name, duration):
+    try:
+        detected_user = "Unknown"
+        with trackers_lock:
+            for t_id, t_data in active_trackers.items():
+                if t_data["user"] not in ["Unknown", "Identifying..."]:
+                    detected_user = t_data["user"]
+                    break
+
+        payload = {
+            "gesture": gesture_name,
+            "user": detected_user,
+            "location": "living_room",
+            "timestamp": time.time(),
+            "duration": duration
+        }
+        presence_session.post(GESTURE_URL, json=payload, timeout=0.5)
+    except Exception as e:
+        pass
+
 def gesture_callback(result, output_image: mp.Image, timestamp_ms: int):
     global latest_gesture, latest_gesture_time, is_gesture_processing
+    global last_sent_gesture, last_sent_gesture_time
+    global current_sustained_gesture, gesture_start_time
+    global current_face_is_frontal
+
     if result.gestures:
         for hand_gestures in result.gestures:
             top_gesture = hand_gestures[0].category_name
+
+            if top_gesture in ["Thumb_Up", "Victory"] and not current_face_is_frontal:
+                print(f"[Gaze Lock] Ignoring '{top_gesture}' because the user is not looking at the camera.")
+                current_sustained_gesture = ""
+                continue
+
             if top_gesture and top_gesture != "None":
                 latest_gesture = top_gesture
                 latest_gesture_time = time.time()
-                print(f"[Async Gesture] Detected: {top_gesture}")
+
+                if top_gesture == current_sustained_gesture:
+                    duration = time.time() - gesture_start_time
+                else:
+                    current_sustained_gesture = top_gesture
+                    gesture_start_time = time.time()
+                    duration = 0.0
+
+                if duration > 1.0:
+                    if top_gesture != last_sent_gesture or (time.time() - last_sent_gesture_time) > GESTURE_COOLDOWN:
+                        print(f"[Async Gesture] Sustained Action: {top_gesture} (Duration: {duration:.1f}s)")
+                        network_executor.submit(send_gesture_event, top_gesture, duration)
+
+                        last_sent_gesture = top_gesture
+                        last_sent_gesture_time = time.time()
+    else:
+        current_sustained_gesture = ""
+
     is_gesture_processing = False
 
 base_options_gesture = python.BaseOptions(model_asset_path=GESTURE_MODEL_PATH)
@@ -597,10 +705,10 @@ def is_face_quality_ok(face_roi, keypoints=None, img_w=640, img_h=480, face_bbox
 
 def camera_processing_loop():
     global next_tracker_id, latest_gesture, latest_gesture_time, is_gesture_processing
-    global latest_jpeg_frame
+    global latest_jpeg_frame, current_face_is_frontal
     last_detection_time = 0
     last_gesture_timestamp_ms = 0
-    fall_frame_counter = 0  # Frame skipping counter for fall detection
+    last_fall_process_time = 0
     
     # Garbage Collector'ın (GC) asenkron resimleri C++ işlenmeden silmesini önlemek için referans listesi
     async_image_buffer = []
@@ -647,6 +755,10 @@ def camera_processing_loop():
                 cv2.putText(frame, f"ID: {user}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 if user not in ["Unknown", "Identifying..."]:
+                    cached_kps = t_data.get("detection_keypoints")
+                    is_frontal = estimate_face_frontality(cached_kps, frame_w, frame_h, (x, y, w, h))
+                    current_face_is_frontal = is_frontal
+
                     if current_time - t_data.get("last_json_time", 0) > 3.0:
                         network_executor.submit(send_presence_json, user)
                         with trackers_lock:
@@ -723,15 +835,19 @@ def camera_processing_loop():
             cv2.putText(frame, f"Gesture: {latest_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
         # 2b. Fall Detection (Transformer + MediaPipe Pose) with frame skipping
-        fall_frame_counter += 1
         is_fall = False
         fall_prob = latest_fall_confidence
-        if fall_frame_counter % FALL_DETECTION_INTERVAL == 0:
+        if current_time - last_fall_process_time >= FALL_FRAME_TIME:
+            last_fall_process_time = current_time
+            
+            # Fonksiyonu çağır (Yakalayamazsa bir önceki iskeleti kopyalama mantığı 
+            # run_fall_detection içinde yapılmış olmalı)
             is_fall, fall_prob = run_fall_detection(rgb_frame)
+            
             if is_fall:
                 screenshot_path = save_fall_screenshot(frame)
                 network_executor.submit(send_fall_alert, fall_prob, screenshot_path)
-
+        # 
         # Draw fall detection status overlay
         if latest_fall_status == "FALL DETECTED":
             cv2.putText(frame, f"FALL DETECTED ({fall_prob:.0%})", (20, frame_h - 30),
