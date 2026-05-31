@@ -1,7 +1,3 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
-setup(
-    name="yolo-smart-home",
-    packages=find_packages(where="."),
-    package_dir={"": "."},
-)
+setup()

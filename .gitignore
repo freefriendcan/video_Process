@@ -53,31 +53,31 @@ env/
 *.swo
 *~
 
-# Project specific
+# Model files (large binaries — download at runtime)
 *.pt
 *.onnx
-data/models/*.pt
-data/models/*.onnx
-data/embeddings/*.pkl
-data/logs/*.jsonl
-data/logs/screenshots/*.png
-data/recordings/*.mp4
+*.tflite
+*.task
 
-# Keep directory structure but ignore contents
+# Keep model directory structure
 data/models/*
+!data/models/.gitkeep
+
+# Runtime data
 data/embeddings/*
 data/logs/*
 data/recordings/*
-!data/models/.gitkeep
+data/test_videos/*
 !data/embeddings/.gitkeep
 !data/logs/.gitkeep
 !data/recordings/.gitkeep
+!data/test_videos/.gitkeep
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Claude
+# Claude / Gemini
 .claude/
 .claude/projects/
 CLAUDE.md

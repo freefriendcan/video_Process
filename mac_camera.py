@@ -33,10 +33,11 @@ time.sleep(2)
 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-IDENTIFY_URL = "http://100.105.136.5:8000/vision/identify" 
-PRESENCE_URL = "http://100.105.136.5:8000/vision/update_presence"
-FALL_ALERT_URL = "http://100.105.136.5:8000/vision/fall_alert"
-GESTURE_URL = "http://100.105.136.5:8000/vision/gesture"
+PI_IP = "100.105.136.5"
+IDENTIFY_URL = f"http://{PI_IP}:8000/vision/identify"
+PRESENCE_URL = f"http://{PI_IP}:8000/vision/update_presence"
+FALL_ALERT_URL = f"http://{PI_IP}:8000/vision/fall_alert"
+GESTURE_URL = f"http://{PI_IP}:8000/vision/gesture"
 
 MODEL_PATH = "blaze_face_short_range.tflite"
 
@@ -90,6 +91,10 @@ SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 # === VELOCITY FILTER (Stage 1: False positive reduction) ===
 VELOCITY_WINDOW = 5           # Frames over which to compute avg velocity
 MIN_FALL_VELOCITY = 0.025     # Min downward y-change per frame to qualify as a fall
+
+# === POST-FALL VERIFICATION (Stage 2: Inactivity confirmation) ===
+POST_FALL_WAIT = 3.0          # Seconds to wait after initial detection
+POST_FALL_MOVE_THRESHOLD = 0.015  # Velocity below this = still on the ground
 
 # MediaPipe Pose for fall detection keypoint extraction
 mp_pose = mp.solutions.pose
@@ -167,6 +172,13 @@ latest_fall_confidence = 0.0
 
 # Velocity tracking — raw (pre-normalization) body center Y positions
 velocity_y_buffer = deque(maxlen=VELOCITY_WINDOW + 1)
+
+# Post-fall verification state machine
+_FALL_STATE_IDLE = "idle"
+_FALL_STATE_MONITORING = "monitoring"
+fall_verification_state = _FALL_STATE_IDLE
+fall_verification_start_time = 0.0
+fall_verification_prob = 0.0  # Cached probability from initial detection
 
 
 if fall_interpreter is not None:
@@ -272,6 +284,26 @@ def extract_and_normalize_pose(rgb_frame):
             normalized[yi] /= torso_h
 
     return normalized
+
+
+def check_post_fall_inactivity():
+    """Check if person remains still after initial fall detection.
+
+    Called every frame during MONITORING state.
+    Returns: 'monitoring', 'confirmed', or 'cancelled'
+    """
+    elapsed = time.time() - fall_verification_start_time
+
+    if elapsed >= POST_FALL_WAIT:
+        return "confirmed"
+
+    body_velocity = compute_body_velocity()
+
+    # Large upward movement = person getting up → cancel
+    if body_velocity < -POST_FALL_MOVE_THRESHOLD:
+        return "cancelled"
+
+    return "monitoring"
 
 
 def run_fall_detection(rgb_frame):
@@ -605,6 +637,8 @@ def is_face_quality_ok(face_roi, keypoints=None, img_w=640, img_h=480, face_bbox
 def camera_processing_loop():
     global next_tracker_id, latest_gesture, latest_gesture_time, is_gesture_processing
     global latest_jpeg_frame, current_face_is_frontal
+    global fall_verification_state, fall_verification_start_time, fall_verification_prob
+    global latest_fall_status, latest_fall_confidence
     last_detection_time = 0
     last_gesture_timestamp_ms = 0
     last_fall_process_time = 0
@@ -733,25 +767,64 @@ def camera_processing_loop():
         if latest_gesture:
             cv2.putText(frame, f"Gesture: {latest_gesture}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
-        # 2b. Fall Detection (Transformer + MediaPipe Pose) with frame skipping
+        # 2b. Fall Detection with post-fall inactivity verification
         is_fall = False
         fall_prob = latest_fall_confidence
+
         if current_time - last_fall_process_time >= FALL_FRAME_TIME:
             last_fall_process_time = current_time
-            
-            # Fonksiyonu çağır (Yakalayamazsa bir önceki iskeleti kopyalama mantığı 
-            # run_fall_detection içinde yapılmış olmalı)
-            is_fall, fall_prob = run_fall_detection(rgb_frame)
-            
-            if is_fall:
-                screenshot_path = save_fall_screenshot(frame)
-                network_executor.submit(send_fall_alert, fall_prob, screenshot_path)
-        # 
+
+            if fall_verification_state == _FALL_STATE_IDLE:
+                is_fall, fall_prob = run_fall_detection(rgb_frame)
+
+                if is_fall:
+                    # Enter monitoring — don't alarm yet
+                    fall_verification_state = _FALL_STATE_MONITORING
+                    fall_verification_start_time = time.time()
+                    fall_verification_prob = fall_prob
+                    latest_fall_status = "⏳ Verifying fall (0.0/3.0s)..."
+                    print(f"[FALL] ⏳ Fall candidate (prob={fall_prob:.2%}). "
+                          f"Starting {POST_FALL_WAIT}s inactivity check...")
+
+            elif fall_verification_state == _FALL_STATE_MONITORING:
+                # Keep feeding velocity buffer during monitoring
+                _ = extract_and_normalize_pose(rgb_frame)
+
+                elapsed = time.time() - fall_verification_start_time
+                result = check_post_fall_inactivity()
+
+                if result == "confirmed":
+                    fall_verification_state = _FALL_STATE_IDLE
+                    latest_fall_status = "FALL CONFIRMED"
+                    latest_fall_confidence = fall_verification_prob
+                    print(f"🚨 FALL CONFIRMED after {POST_FALL_WAIT}s inactivity! "
+                          f"prob={fall_verification_prob:.2%}")
+                    screenshot_path = save_fall_screenshot(frame)
+                    network_executor.submit(
+                        send_fall_alert, fall_verification_prob, screenshot_path
+                    )
+                elif result == "cancelled":
+                    fall_verification_state = _FALL_STATE_IDLE
+                    latest_fall_status = "Stumble (recovered)"
+                    latest_fall_confidence = 0.0
+                    print(f"[FALL] ↩️ Person recovered after {elapsed:.1f}s. "
+                          f"Fall cancelled.")
+                else:
+                    latest_fall_status = f"⏳ Verifying fall ({elapsed:.1f}/{POST_FALL_WAIT}s)..."
+
         # Draw fall detection status overlay
-        if latest_fall_status == "FALL DETECTED":
-            cv2.putText(frame, f"FALL DETECTED ({fall_prob:.0%})", (20, frame_h - 30),
+        if fall_verification_state == _FALL_STATE_MONITORING:
+            elapsed = time.time() - fall_verification_start_time
+            cv2.putText(frame,
+                        f"VERIFYING FALL ({elapsed:.1f}s/{POST_FALL_WAIT}s)",
+                        (20, frame_h - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+        elif latest_fall_status == "FALL CONFIRMED":
+            cv2.putText(frame,
+                        f"FALL CONFIRMED ({latest_fall_confidence:.0%})",
+                        (20, frame_h - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-        elif latest_fall_status and latest_fall_status != "Standing":
+        elif latest_fall_status and latest_fall_status not in ("Standing", ""):
             cv2.putText(frame, latest_fall_status, (20, frame_h - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 

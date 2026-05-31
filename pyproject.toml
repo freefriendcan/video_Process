@@ -3,16 +3,16 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yolo-smart-home"
-version = "0.1.0"
-description = "YOLO-based smart home video processing system for face recognition, fall detection, and gesture recognition"
+name = "vision-pipeline"
+version = "0.2.0"
+description = "Edge-AI vision pipeline for smart home — face tracking, gesture recognition, and fall detection on macOS"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
-keywords = ["yolo", "computer-vision", "smart-home", "face-recognition", "fall-detection"]
+keywords = ["computer-vision", "smart-home", "face-recognition", "fall-detection", "edge-ai", "mediapipe"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,20 +26,29 @@ classifiers = [
 ]
 
 dependencies = [
-    # Core
-    "ultralytics>=8.0.0",
+    # Core CV
     "opencv-python>=4.8.0",
+    "mediapipe>=0.10.14",
+    "numpy>=1.24.0",
+
+    # TFLite Runtime (fall detection transformer)
+    "ai-edge-litert>=2.1.0",
+
+    # Streaming
+    "flask>=3.0.0",
+
+    # HTTP client (agent communication)
+    "requests>=2.31.0",
+
+    # Future use (ByteTrack, on-device face recognition)
+    "ultralytics>=8.0.0",
     "torch>=2.0.0",
-    # Recognition
     "deepface>=0.0.80",
     "onnxruntime>=1.16.0",
+
     # Utilities
-    "pyyaml>=6.0",
-    "loguru>=0.7.0",
-    "pydantic>=2.0.0",
-    "click>=8.1.0",
     "pillow>=10.0.0",
-    "numpy>=1.24.0",
+    "loguru>=0.7.0",
 ]
 
 [project.optional-dependencies]
@@ -52,16 +61,9 @@ dev = [
     "mypy>=1.5.0",
 ]
 
-[project.scripts]
-yolo-home = "src.main:cli"
-
 [project.urls]
-Homepage = "https://github.com/yourusername/yolo-smart-home"
-Repository = "https://github.com/yourusername/yolo-smart-home"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+Homepage = "https://github.com/yourusername/video_Process"
+Repository = "https://github.com/yourusername/video_Process"
 
 [tool.black]
 line-length = 100

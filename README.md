@@ -1,207 +1,97 @@
-# YOLO Smart Home Video Processing System
+# Vision Pipeline — Edge-AI Smart Home
 
-An AI-powered smart home video processing system using YOLO-based computer vision. Performs real-time face recognition, fall detection, and gesture recognition with support for live camera streams (RTSP/IP cameras, USB webcams) and pre-recorded video files.
+Real-time computer vision pipeline for smart home environments. Runs face tracking with identification, gesture recognition, and transformer-based fall detection on a live camera stream. Analyzed insights are transmitted to a downstream [proactive-home-agent](https://github.com/yourusername/proactive-home-agent) for agentic decision-making.
 
-Optimized for Apple Silicon Mac (M1/M2/M3) using MPS (Metal Performance Shaders) acceleration.
+Optimized for macOS with Apple Silicon (M1/M2/M3/M4).
 
 ## Features
 
-- **Face Recognition**: Detect and identify known persons using DeepFace embeddings
-- **Fall Detection**: Pose-based fall detection for elderly care and safety monitoring
-- **Gesture Recognition**: Recognize gestures like waving, hands up, pointing, and crouching
-- **Multiple Input Sources**: USB cameras, RTSP/IP cameras, and video files
-- **Real-time Processing**: Threaded capture for non-blocking inference
-- **Event System**: Alert generation with configurable cooldowns and logging
-- **MPS Acceleration**: Optimized for Apple Silicon with automatic device selection
-
-## Installation
-
-### Requirements
-
-- Python 3.10 or higher
-- macOS (for MPS acceleration) or Linux/Windows
-- 4GB+ RAM recommended
-
-### Setup
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd video_Process
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Models will be automatically downloaded on first run to `data/models/`.
+- **Face Detection & Tracking**: BlazeFace short-range detection + KCF tracker with IoU-based re-identification
+- **Face Identification**: Quality-gated face crops sent to remote Pi 5 for DeepFace-based identification
+- **Gesture Recognition**: MediaPipe async gesture recognizer with sustained-gesture detection and gaze-lock filtering
+- **Fall Detection**: Transformer-based fall classifier (TFLite) with 3-stage pipeline:
+  1. MediaPipe Pose keypoint extraction + hip-centered normalization
+  2. Velocity gate (reject slow movements like sitting/bending)
+  3. Post-fall inactivity verification (3s confirmation window)
+- **Live Streaming**: Flask MJPEG stream with annotated bounding boxes and status overlays
+- **Graceful Shutdown**: SIGINT/SIGTERM handler sends `camera_offline` signal to backend
 
 ## Quick Start
 
-### Run with default camera
-
 ```bash
-python -m src.main run
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the pipeline
+python mac_camera.py
 ```
 
-### Run with video file
+Open `http://localhost:5001/` to view the live annotated camera feed.
 
-```bash
-python -m src.main run --source file --path path/to/video.mp4
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  mac_camera.py                       │
+│                                                      │
+│  ┌──────────┐   ┌────────────┐   ┌───────────────┐  │
+│  │ Camera    │──▶│ Processing │──▶│ Flask MJPEG   │  │
+│  │ Capture   │   │ Loop       │   │ Stream        │  │
+│  └──────────┘   └─────┬──────┘   └───────────────┘  │
+│                       │                              │
+│         ┌─────────────┼─────────────┐                │
+│         ▼             ▼             ▼                │
+│  ┌────────────┐ ┌──────────┐ ┌──────────────┐       │
+│  │ BlazeFace  │ │ Gesture  │ │ Fall         │       │
+│  │ + KCF      │ │ (async)  │ │ Detection    │       │
+│  │ Tracking   │ │          │ │ (Transformer)│       │
+│  └─────┬──────┘ └────┬─────┘ └──────┬───────┘       │
+│        │              │              │               │
+│        ▼              ▼              ▼               │
+│  ┌──────────────────────────────────────────────┐    │
+│  │         ThreadPoolExecutor (HTTP)             │    │
+│  │   → Pi:8000/vision/identify                   │    │
+│  │   → Pi:8000/vision/update_presence            │    │
+│  │   → Pi:8000/vision/gesture                    │    │
+│  │   → Pi:8000/vision/fall_alert                 │    │
+│  └──────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │ proactive-home-agent │
+              │ (Pi 5 Backend)       │
+              └─────────────────────┘
 ```
 
-### Run with RTSP camera
+## Models
 
-```bash
-python -m src.main run --source rtsp --path rtsp://192.168.1.100:554/stream
-```
-
-## Commands
-
-### `run` - Start video processing
-
-```bash
-python -m src.main run [OPTIONS]
-```
-
-Options:
-- `--source`: Video source (camera, rtsp, file)
-- `--path`: Camera index, RTSP URL, or file path
-- `--config`: Path to config file
-- `--no-display`: Disable display window
-
-### `register-face` - Register a face for recognition
-
-```bash
-python -m src.main register-face --name "John Doe"
-```
-
-Options:
-- `--name`: Name of the person (required)
-- `--source`: Video source
-- `--faces`: Number of face images to capture (default: 5)
-
-### `list-models` - List available YOLO models
-
-```bash
-python -m src.main list-models
-```
-
-### `device-info` - Show device and acceleration information
-
-```bash
-python -m src.main device-info
-```
-
-### `forget-face` - Remove a face from database
-
-```bash
-python -m src.main forget-face --name "John Doe"
-```
+| Model | File | Purpose |
+|-------|------|---------|
+| BlazeFace Short Range | `blaze_face_short_range.tflite` | Face detection (auto-downloaded) |
+| MediaPipe Gesture Recognizer | `gesture_recognizer.task` | Hand gesture recognition (auto-downloaded) |
+| Fall Detection Transformer | `data/models/fall_detection_transformer.tflite` | Pose-sequence fall classification |
+| YOLOv8n Face | `data/models/yolov8n-face.pt` | Reserved for future on-device face detection |
 
 ## Configuration
 
-Configuration is managed via `config/default_config.yaml`:
+Key constants are defined at the top of `mac_camera.py`:
 
-```yaml
-video:
-  source: "camera"
-  path: "0"
-  fps: 30
-  resolution: [1280, 720]
-  queue_size: 10
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `PI_IP` | `100.105.136.5` | Backend agent IP address |
+| `FALL_CONFIDENCE_THRESHOLD` | `0.90` | Minimum probability for fall alert |
+| `FALL_ALERT_COOLDOWN` | `10s` | Seconds between fall alerts |
+| `POST_FALL_WAIT` | `3.0s` | Inactivity verification window |
+| `GESTURE_COOLDOWN` | `1.0s` | Minimum interval between gesture events |
+| `MIN_FACE_ROI_SIZE` | `60px` | Minimum face size for identification |
 
-detection:
-  device: "auto"    # auto, mps, cpu, cuda
-  confidence: 0.5
-  iou: 0.45
+## Requirements
 
-face_recognition:
-  enabled: true
-  model: "VGG-Face"
-  threshold: 0.4
-  database_path: "data/embeddings/faces.pkl"
-
-fall_detection:
-  enabled: true
-  aspect_ratio_threshold: 2.5
-  min_frames_for_fall: 5
-  alert_cooldown: 30
-
-gesture_detection:
-  enabled: true
-  smoothing_window: 5
-  min_confidence: 0.7
-
-alerts:
-  console: true
-  log_file: "data/logs/events.jsonl"
-  screenshot_on_event: true
-  screenshot_path: "data/logs/screenshots"
-```
-
-You can also override settings via environment variables:
-```bash
-export VIDEO_DETECTION_CONFIDENCE=0.7
-export VIDEO_FACE_RECOGNITION_THRESHOLD=0.3
-python -m src.main run
-```
-
-## Project Structure
-
-```
-video_Process/
-├── src/
-│   ├── config/          # Configuration management
-│   ├── capture/         # Video capture (camera, file, RTSP)
-│   ├── detectors/       # YOLO-based detectors
-│   ├── recognizers/     # High-level recognition (face, fall, gesture)
-│   ├── events/          # Event handling and alerts
-│   ├── utils/           # Visualization and geometry
-│   └── models/          # Model management
-├── data/
-│   ├── models/          # Downloaded YOLO models
-│   ├── embeddings/      # Face embeddings database
-│   ├── logs/            # Event logs
-│   └── recordings/      # Optional video recordings
-├── config/
-│   └── default_config.yaml
-└── tests/               # Test suite
-```
-
-## Supported Gestures
-
-- **wave**: Hand waving motion detection
-- **hands_up**: Both hands raised above shoulders
-- **pointing**: One arm extended, other arm down
-- **crouching**: Knees below hip level
-
-## Adding Custom Gestures
-
-Extend `BaseGesture` in `src/recognizers/gesture_detector.py`:
-
-```python
-class MyGesture(BaseGesture):
-    name = "my_gesture"
-
-    def detect(self, keypoints: np.ndarray) -> bool:
-        # Implement gesture detection logic
-        # keypoints: (17, 3) array with x, y, confidence
-        return True  # Return True if gesture detected
-```
-
-Register in `GestureDetector.__init__()` or use `add_gesture()`.
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| MPS not available | Ensure PyTorch >= 2.0 with MPS support |
-| Camera not opening | Check permissions; try different camera index |
-| Poor face recognition | Lower threshold or register more angles |
-| Fall detection too sensitive | Increase `min_frames_for_fall` |
-| High CPU usage | Reduce resolution or FPS |
+- Python 3.10+
+- macOS (tested on Apple Silicon)
+- Webcam access
+- Network access to Pi 5 backend (for face identification and event dispatch)
 
 ## License
 
