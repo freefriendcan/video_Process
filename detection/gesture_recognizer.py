@@ -5,6 +5,7 @@ import urllib.request
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from loguru import logger
 
 from config import PipelineConfig
 from events.dispatcher import EventDispatcher
@@ -37,13 +38,16 @@ class GestureRecognizer:
         self._last_timestamp_ms = 0
 
         if not os.path.exists(cfg.gesture_model):
-            print("Downloading gesture_recognizer.task...")
+            logger.info("Downloading gesture_recognizer.task...")
             urllib.request.urlretrieve(
                 "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
                 cfg.gesture_model,
             )
 
-        base_options = python.BaseOptions(model_asset_path=cfg.gesture_model)
+        base_options = python.BaseOptions(
+            model_asset_path=cfg.gesture_model,
+            delegate=python.BaseOptions.Delegate.CPU,
+        )
         options = vision.GestureRecognizerOptions(
             base_options=base_options,
             running_mode=vision.RunningMode.LIVE_STREAM,
@@ -73,7 +77,7 @@ class GestureRecognizer:
                 top_gesture = hand_gestures[0].category_name
 
                 if top_gesture in ["Thumb_Up", "Victory"] and not self.is_frontal:
-                    print(f"[Gaze Lock] Ignoring '{top_gesture}' because the user is not looking at the camera.")
+                    logger.debug("Gaze Lock: ignoring '{}' — user not looking at camera", top_gesture)
                     self._current_sustained = ""
                     continue
 
@@ -91,7 +95,7 @@ class GestureRecognizer:
                     if duration > 1.0:
                         if (top_gesture != self._last_sent or
                                 (time.time() - self._last_sent_time) > self._cfg.gesture_cooldown):
-                            print(f"[Async Gesture] Sustained Action: {top_gesture} (Duration: {duration:.1f}s)")
+                            logger.info("Sustained gesture: {} (duration: {:.1f}s)", top_gesture, duration)
                             detected_user = self._get_active_user()
                             self._dispatcher.submit(
                                 self._dispatcher.send_gesture_event,

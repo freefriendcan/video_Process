@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
+from loguru import logger
 
 from config import PipelineConfig
 
@@ -37,9 +38,9 @@ class EventDispatcher:
             else:
                 resp = requests.post(self._cfg.fall_alert_url, json=payload, timeout=3.0)
 
-            print(f"[FALL] Alert sent to backend: {resp.status_code}")
+            logger.info("Fall alert sent to backend: {}", resp.status_code)
         except Exception as e:
-            print(f"[FALL] Alert send error: {e}")
+            logger.error("Fall alert send error: {}", e)
 
     def send_gesture_event(self, gesture_name, duration, user_name="Unknown"):
         try:
@@ -65,6 +66,6 @@ class EventDispatcher:
         try:
             payload = {"user": "System", "status": "camera_offline", "location": "living_room"}
             requests.post(self._cfg.presence_url, json=payload, timeout=2.0)
-            print("The 'camera_offline' signal was successfully sent to the backend.")
+            logger.info("camera_offline signal sent to backend")
         except Exception as e:
-            print(f"An error occurred while sending a signal to the backend: {e}")
+            logger.error("Failed to send offline signal: {}", e)

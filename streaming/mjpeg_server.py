@@ -2,6 +2,7 @@ import time
 
 from flask import Flask, Response
 from flask_cors import CORS
+from loguru import logger
 
 from config import PipelineConfig
 
@@ -45,5 +46,5 @@ class MjpegServer:
             time.sleep(0.03)
 
     def run(self):
-        print(f"Multi-Tracking Vision (Tasks API) Active: http://{self._cfg.server_host}:{self._cfg.server_port}/")
+        logger.info("MJPEG stream active: http://{}:{}/", self._cfg.server_host, self._cfg.server_port)
         self.app.run(host=self._cfg.server_host, port=self._cfg.server_port)

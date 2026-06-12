@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from loguru import logger
 
 from config import PipelineConfig
 
@@ -24,41 +25,45 @@ class FaceQualityGate:
 
         return True
 
-    def check(self, face_roi, keypoints=None, img_w=640, img_h=480, face_bbox=None):
+    def check(self, face_roi, keypoints=None, img_w=640, img_h=480,
+              face_bbox=None, ir_mode: bool = False):
         """4-layer quality gate: Size/Ratio -> Brightness -> Blur -> Pose.
 
         Returns (passed: bool, quality_score: float).
+        ``ir_mode`` relaxes brightness thresholds for IR night vision.
         """
         h, w = face_roi.shape[:2]
         cfg = self._cfg
 
         # Layer 1: Size & Aspect Ratio (instant)
         if w < cfg.min_face_roi_size or h < cfg.min_face_roi_size:
-            print(f"[QualityGate] BLOCKED: too small ({w}x{h})")
+            logger.debug("QualityGate: too small ({}x{})", w, h)
             return False, 0.0
 
         aspect_ratio = w / float(h)
         if aspect_ratio < 0.5 or aspect_ratio > 1.5:
-            print(f"[QualityGate] BLOCKED: bad aspect ratio ({aspect_ratio:.2f})")
+            logger.debug("QualityGate: bad aspect ratio ({:.2f})", aspect_ratio)
             return False, 0.0
 
         # Layer 2: Brightness (cheap — single np.mean)
         gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
         mean_brightness = np.mean(gray)
-        if mean_brightness < cfg.min_brightness or mean_brightness > cfg.max_brightness:
-            print(f"[QualityGate] BLOCKED: bad brightness ({mean_brightness:.0f})")
+        min_b = 15 if ir_mode else cfg.min_brightness
+        max_b = 200 if ir_mode else cfg.max_brightness
+        if mean_brightness < min_b or mean_brightness > max_b:
+            logger.debug("QualityGate: bad brightness ({:.0f}, ir={})", mean_brightness, ir_mode)
             return False, 0.0
 
         # Layer 3: Blur (moderate — Laplacian convolution)
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         if variance < cfg.min_laplacian_variance:
-            print(f"[QualityGate] BLOCKED: too blurry (laplacian={variance:.0f})")
+            logger.debug("QualityGate: too blurry (laplacian={:.0f})", variance)
             return False, 0.0
 
         # Layer 4: Pose via BlazeFace keypoints (zero extra cost)
         if keypoints is not None and face_bbox is not None:
             if not self.estimate_frontality(keypoints, img_w, img_h, face_bbox):
-                print(f"[QualityGate] BLOCKED: profile/angled face")
+                logger.debug("QualityGate: profile/angled face")
                 return False, 0.0
 
         return True, variance

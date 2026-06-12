@@ -1,6 +1,7 @@
 import threading
 
 import cv2
+from loguru import logger
 
 from config import PipelineConfig
 
@@ -55,7 +56,7 @@ class TrackerManager:
                         continue
 
                     if current_time - t_data.get("last_blazeface_update", current_time) > 1.0:
-                        print(f"[{t_id}] Tracker TTL expired (Ghost box). Force deleting.")
+                        logger.debug("[{}] Tracker TTL expired (ghost box) — force deleting", t_id)
                         to_delete.append(t_id)
                         continue
 
@@ -78,7 +79,7 @@ class TrackerManager:
         with self._lock:
             for t_id in to_delete:
                 if t_id in self._trackers:
-                    print(f"Box Lost [{t_id}]. Being deleted from the dictionary.")
+                    logger.debug("Box lost [{}] — removing from tracker dict", t_id)
                     del self._trackers[t_id]
 
         return active
@@ -114,7 +115,7 @@ class TrackerManager:
                         self._trackers[matched_id]["detection_keypoints"] = keypoints
                         self._trackers[matched_id]["last_blazeface_update"] = current_time
             else:
-                print(f"New Face Found! Tracking Initiates (ID: {self._next_id})")
+                logger.info("New face detected — tracking initiated (ID: {})", self._next_id)
                 tracker = cv2.TrackerKCF_create()
                 tracker.init(frame, (x, y, w, h))
 

@@ -1,5 +1,6 @@
 import cv2
 import requests
+from loguru import logger
 
 from config import PipelineConfig
 from tracking.tracker_manager import TrackerManager
@@ -16,11 +17,11 @@ class FaceIdentifier:
         try:
             ret, buffer = cv2.imencode('.jpg', face_roi_raw)
             if not ret:
-                print(f"[{tracker_id}] JPEG encode failed in worker thread")
+                logger.warning("[{}] JPEG encode failed in worker thread", tracker_id)
                 return
 
             frame_bytes = buffer.tobytes()
-            print(f"[{tracker_id}] The face is being sent to Pi 5, awaiting identification...")
+            logger.debug("[{}] Sending face to Pi 5 for identification...", tracker_id)
 
             files = {'image_file': ('face.jpg', frame_bytes, 'image/jpeg')}
 
@@ -31,17 +32,17 @@ class FaceIdentifier:
                 if data.get("status") == "authorized":
                     result = self._tracker_mgr.set_user(tracker_id, data["user"], retry_count=0)
                     if result is None:
-                        print(f"[{tracker_id}] Tracker already removed, discarding result.")
+                        logger.debug("[{}] Tracker already removed, discarding result", tracker_id)
                     else:
-                        print(f"Identity Verified [{tracker_id}]: {data['user']}")
+                        logger.info("Identity verified [{}]: {}", tracker_id, data['user'])
                 else:
                     count = self._tracker_mgr.set_user(tracker_id, "Unknown", increment_retry=True)
                     if count is not None:
-                        print(f"Stranger or Unknown [{tracker_id}]. (Failed Attempt: {count}/{self._cfg.max_retries})")
+                        logger.info("Unknown face [{}] (attempt {}/{})", tracker_id, count, self._cfg.max_retries)
             else:
-                print(f"[{tracker_id}] Backend error returned.")
+                logger.warning("[{}] Backend returned error", tracker_id)
                 self._tracker_mgr.set_user(tracker_id, "Unknown")
 
         except Exception as e:
-            print(f"[{tracker_id}] Pi could not be reached: {e}")
+            logger.error("[{}] Pi unreachable: {}", tracker_id, e)
             self._tracker_mgr.set_user(tracker_id, "Unknown", increment_retry=True)

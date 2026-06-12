@@ -1,11 +1,24 @@
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @dataclass
 class PipelineConfig:
-    # Camera
-    camera_index: int = 0
+    # RTSP (Tapo C225)
+    rtsp_url: str = ""
+    rtsp_hires_url: str = ""
+    rtsp_reconnect_delay: float = 2.0
+    rtsp_max_reconnect_delay: float = 30.0
+
+    # IR Detection
+    ir_std_threshold: float = 3.0
+
+    # Frame
     frame_width: int = 640
     frame_height: int = 480
 
@@ -76,3 +89,12 @@ class PipelineConfig:
 
     def __post_init__(self):
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build RTSP URLs from environment when not set explicitly
+        if not self.rtsp_url:
+            ip = os.environ.get("TAPO_IP", "")
+            user = os.environ.get("TAPO_USER", "")
+            pw = os.environ.get("TAPO_PASS", "")
+            if ip and user and pw:
+                self.rtsp_url = f"rtsp://{user}:{pw}@{ip}:554/stream2"
+                self.rtsp_hires_url = f"rtsp://{user}:{pw}@{ip}:554/stream1"

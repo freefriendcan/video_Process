@@ -5,6 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import mediapipe as mp
+from loguru import logger
 
 from config import PipelineConfig
 
@@ -73,7 +74,7 @@ class FallDetector:
 
     def _init_interpreter(self):
         if not Path(self._cfg.fall_model).exists():
-            print(f"[FATAL] Fall model not found at {self._cfg.fall_model}. Fall detection disabled.")
+            logger.error("Fall model not found at {}. Fall detection disabled.", self._cfg.fall_model)
             return
 
         TFLiteInterpreter = None
@@ -86,18 +87,18 @@ class FallDetector:
                 try:
                     from tensorflow.lite import Interpreter as TFLiteInterpreter
                 except ImportError:
-                    print("[WARN] No TFLite runtime found. Install: pip install ai-edge-litert")
+                    logger.warning("No TFLite runtime found. Install: pip install ai-edge-litert")
 
         if TFLiteInterpreter:
             self._interpreter = TFLiteInterpreter(model_path=self._cfg.fall_model)
             self._interpreter.allocate_tensors()
             self._input_details = self._interpreter.get_input_details()
             self._output_details = self._interpreter.get_output_details()
-            print(f"[FALL] Transformer model loaded: {self._cfg.fall_model} "
-                  f"(input: {self._input_details[0]['shape']})")
-            print("[FALL] ✅ Active method: Transformer (TFLite)")
+            logger.info("Transformer model loaded: {} (input: {})",
+                        self._cfg.fall_model, self._input_details[0]['shape'])
+            logger.success("Fall detector active: Transformer (TFLite)")
         else:
-            print("[FALL] ❌ Transformer model unavailable. Fall detection is DISABLED.")
+            logger.error("Transformer model unavailable. Fall detection is DISABLED.")
 
     @property
     def enabled(self):
@@ -228,7 +229,7 @@ class FallDetector:
             output = self._interpreter.get_tensor(self._output_details[0]['index'])
             fall_prob = float(output[0][0])
         except Exception as e:
-            print(f"[FALL] Inference error: {e}")
+            logger.error("Fall inference error: {}", e)
             return False, 0.0
 
         is_fall = fall_prob >= self._cfg.fall_confidence_threshold
@@ -238,15 +239,15 @@ class FallDetector:
             body_velocity = self._compute_body_velocity()
             if body_velocity < self._cfg.min_fall_velocity:
                 self.status = f"Slow motion (v={body_velocity:.4f})"
-                print(f"[FALL] ❌ Velocity too low ({body_velocity:.4f} < {self._cfg.min_fall_velocity}). "
-                      f"Likely sitting/bending. prob={fall_prob:.2%}")
+                logger.debug("Velocity too low ({:.4f} < {}) — likely sitting/bending (prob={:.2%})",
+                             body_velocity, self._cfg.min_fall_velocity, fall_prob)
                 return False, fall_prob
 
             self.status = "FALL DETECTED"
             now = time.time()
             if (now - self._last_alert_time) > self._cfg.fall_alert_cooldown:
                 self._last_alert_time = now
-                print(f"\U0001f6a8 FALL DETECTED! Probability: {fall_prob:.2%} (velocity: {body_velocity:.4f})")
+                logger.warning("🚨 FALL DETECTED! prob={:.2%} velocity={:.4f}", fall_prob, body_velocity)
                 return True, fall_prob
         else:
             self.status = "Standing"
@@ -260,10 +261,10 @@ class FallDetector:
         filepath = self._cfg.screenshot_dir / filename
         try:
             cv2.imwrite(str(filepath), bgr_frame)
-            print(f"[FALL] Screenshot saved: {filepath}")
+            logger.info("Screenshot saved: {}", filepath)
             return str(filepath)
         except Exception as e:
-            print(f"[FALL] Screenshot save error: {e}")
+            logger.error("Screenshot save error: {}", e)
             return None
 
     def process_frame(self, rgb_frame, bgr_frame, current_time):
@@ -282,8 +283,8 @@ class FallDetector:
                 self._verification_start = time.time()
                 self._verification_prob = fall_prob
                 self.status = f"⏳ Verifying fall (0.0/{self._cfg.post_fall_wait}s)..."
-                print(f"[FALL] ⏳ Fall candidate (prob={fall_prob:.2%}). "
-                      f"Starting {self._cfg.post_fall_wait}s inactivity check...")
+                logger.info("Fall candidate (prob={:.2%}) — starting {:.0f}s inactivity check",
+                            fall_prob, self._cfg.post_fall_wait)
 
         elif self._verification_state == self._STATE_MONITORING:
             self._extract_and_normalize_pose(rgb_frame)
@@ -294,15 +295,15 @@ class FallDetector:
                 self._verification_state = self._STATE_IDLE
                 self.status = "FALL CONFIRMED"
                 self.confidence = self._verification_prob
-                print(f"\U0001f6a8 FALL CONFIRMED after {self._cfg.post_fall_wait}s inactivity! "
-                      f"prob={self._verification_prob:.2%}")
+                logger.critical("🚨 FALL CONFIRMED after {:.0f}s inactivity! prob={:.2%}",
+                                self._cfg.post_fall_wait, self._verification_prob)
                 screenshot_path = self._save_screenshot(bgr_frame)
                 return self._verification_prob, screenshot_path
             elif result == "cancelled":
                 self._verification_state = self._STATE_IDLE
                 self.status = "Stumble (recovered)"
                 self.confidence = 0.0
-                print(f"[FALL] ↩️ Person recovered after {elapsed:.1f}s. Fall cancelled.")
+                logger.info("Person recovered after {:.1f}s — fall cancelled", elapsed)
             else:
                 self.status = f"⏳ Verifying fall ({elapsed:.1f}/{self._cfg.post_fall_wait}s)..."
 

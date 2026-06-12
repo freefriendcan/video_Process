@@ -8,6 +8,10 @@ ai-edge-litert>=2.1.0
 
 # Streaming
 flask>=3.0.0
+flask-cors>=4.0.0
+
+# Config
+python-dotenv>=1.0.0
 
 # HTTP Client (agent communication)
 requests>=2.31.0
