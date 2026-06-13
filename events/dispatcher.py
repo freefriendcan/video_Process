@@ -65,7 +65,7 @@ class EventDispatcher:
     def send_offline_signal(self):
         try:
             payload = {"user": "System", "status": "camera_offline", "location": "living_room"}
-            requests.post(self._cfg.presence_url, json=payload, timeout=2.0)
+            requests.post(self._cfg.presence_url, json=payload, timeout=0.5)
             logger.info("camera_offline signal sent to backend")
         except Exception as e:
-            logger.error("Failed to send offline signal: {}", e)
+            logger.warning("Failed to send offline signal: {}", e)

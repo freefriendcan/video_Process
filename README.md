@@ -13,7 +13,7 @@ Optimized for macOS with Apple Silicon (M1/M2/M3/M4).
   1. MediaPipe Pose keypoint extraction + hip-centered normalization
   2. Velocity gate (reject slow movements like sitting/bending)
   3. Post-fall inactivity verification (3s confirmation window)
-- **Live Streaming**: Flask MJPEG stream with annotated bounding boxes and status overlays
+- **Live Streaming**: go2rtc WebRTC HD video for dashboards plus a lightweight vision-state WebSocket for overlays
 - **Graceful Shutdown**: SIGINT/SIGTERM handler sends `camera_offline` signal to backend
 
 ## Quick Start
@@ -22,11 +22,22 @@ Optimized for macOS with Apple Silicon (M1/M2/M3/M4).
 # Install dependencies
 pip install -r requirements.txt
 
+# Start go2rtc
+docker compose -f go2rtc/docker-compose.yaml up -d
+
 # Run the pipeline
-python mac_camera.py
+uv run python main.py
 ```
 
-Open `http://localhost:5001/` to view the live annotated camera feed.
+Open the dashboard video stream with WebRTC:
+
+```text
+http://localhost:1984/stream.html?src=living_room_hd&mode=webrtc
+```
+
+For local Docker Desktop usage, go2rtc advertises `127.0.0.1:8555` as the WebRTC ICE candidate. Close any older go2rtc tabs opened without `mode=webrtc`; those tabs will show up as `mse/fmp4` consumers.
+
+The pipeline publishes overlay metadata separately on `ws://localhost:5003`.
 
 ## Architecture
 
@@ -35,8 +46,8 @@ Open `http://localhost:5001/` to view the live annotated camera feed.
 │                  mac_camera.py                       │
 │                                                      │
 │  ┌──────────┐   ┌────────────┐   ┌───────────────┐  │
-│  │ Camera    │──▶│ Processing │──▶│ Flask MJPEG   │  │
-│  │ Capture   │   │ Loop       │   │ Stream        │  │
+│  │ RTSP SD   │──▶│ Processing │──▶│ Vision State  │  │
+│  │ Capture   │   │ Loop       │   │ WebSocket     │  │
 │  └──────────┘   └─────┬──────┘   └───────────────┘  │
 │                       │                              │
 │         ┌─────────────┼─────────────┐                │
@@ -72,6 +83,14 @@ Open `http://localhost:5001/` to view the live annotated camera feed.
 | MediaPipe Gesture Recognizer | `gesture_recognizer.task` | Hand gesture recognition (auto-downloaded) |
 | Fall Detection Transformer | `data/models/fall_detection_transformer.tflite` | Pose-sequence fall classification |
 | YOLOv8n Face | `data/models/yolov8n-face.pt` | Reserved for future on-device face detection |
+
+## Streaming Layout
+
+| Purpose | go2rtc stream | Transport | Source |
+|---------|---------------|-----------|--------|
+| Computer vision input | `living_room_sd` | RTSP | Tapo `/stream2` |
+| Dashboard video | `living_room_hd` | WebRTC | Tapo `/stream1` |
+| Overlay metadata | `ws://localhost:5003` | WebSocket JSON | Pipeline state |
 
 ## Configuration
 

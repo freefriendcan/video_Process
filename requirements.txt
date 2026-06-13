@@ -1,14 +1,13 @@
 # Core CV
 opencv-python>=4.8.0
-mediapipe>=0.10.14
+mediapipe==0.10.14
 numpy>=1.24.0
 
 # TFLite Runtime (fall detection transformer)
 ai-edge-litert>=2.1.0
 
 # Streaming
-flask>=3.0.0
-flask-cors>=4.0.0
+websockets>=12.0
 
 # Config
 python-dotenv>=1.0.0
@@ -20,7 +19,7 @@ requests>=2.31.0
 ultralytics>=8.0.0
 torch>=2.0.0
 deepface>=0.0.80
-onnxruntime>=1.16.0
+onnxruntime>=1.16.0,<1.24.0
 face-alignment>=1.4.0
 scikit-image>=0.21.0
 

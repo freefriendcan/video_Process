@@ -3,7 +3,6 @@ import sys
 import threading
 import time
 
-import cv2
 from loguru import logger
 
 # Configure loguru: remove default handler, add custom sinks
@@ -33,7 +32,8 @@ from detection.fall_detector import FallDetector
 from tracking.tracker_manager import TrackerManager
 from identification.face_identifier import FaceIdentifier
 from capture.frame_producer import FrameProducer
-from streaming.mjpeg_server import MjpegServer
+from streaming.vision_state import TrackedFace, VisionState
+from streaming.vision_ws_server import VisionWSServer
 
 
 class VisionPipeline:
@@ -43,28 +43,56 @@ class VisionPipeline:
         self._dispatcher = EventDispatcher(cfg)
         self._tracker_mgr = TrackerManager(cfg)
         self._producer = FrameProducer(cfg)
-        self._server = MjpegServer(cfg)
+        self._ws_server = VisionWSServer(cfg)
         self._face_det = FaceDetector(cfg)
         self._gesture_rec = GestureRecognizer(cfg, self._dispatcher, self._tracker_mgr.get_active_user)
         self._fall_det = FallDetector(cfg)
         self._identifier = FaceIdentifier(cfg, self._tracker_mgr)
+        self._frame_counter = 0
+        self._last_state_time = 0.0
+        self._fps = 0.0
+        self._running = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
 
     def run(self):
+        self._cfg.preflight()
         self._producer.open()
+        self._ws_server.start()
+        self._running = True
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
-        threading.Thread(target=self._camera_loop, daemon=True).start()
-        self._server.run()
+        self._camera_loop()
 
     def shutdown(self):
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                logger.info("Shutdown already in progress; duplicate request ignored")
+                return False
+            self._shutdown_started = True
+
         logger.info("CTRL+C caught — shutting down camera safely...")
+        self._running = False
         try:
             self._dispatcher.send_offline_signal()
         finally:
-            self._dispatcher.shutdown()
-            self._producer.release()
+            cleanup_steps = (
+                ("dispatcher", self._dispatcher.shutdown),
+                ("frame producer", self._producer.release),
+                ("vision websocket", self._ws_server.stop),
+            )
+            for name, shutdown_fn in cleanup_steps:
+                try:
+                    shutdown_fn()
+                except Exception as exc:
+                    logger.exception("Error during {} shutdown: {}", name, exc)
+        return True
 
     def _handle_signal(self, signum, frame):
+        if self._shutdown_started:
+            logger.warning("Second interrupt received; forcing exit")
+            sys.exit(130)
+
         self.shutdown()
         sys.exit(0)
 
@@ -78,11 +106,11 @@ class VisionPipeline:
         face_det = self._face_det
         identifier = self._identifier
         producer = self._producer
-        server = self._server
+        ws_server = self._ws_server
 
         last_detection_time = 0
 
-        while True:
+        while self._running:
             pkt = producer.read_latest()
             if pkt is None:
                 time.sleep(0.005)
@@ -91,6 +119,7 @@ class VisionPipeline:
             frame = pkt.bgr
             frame_h, frame_w = pkt.height, pkt.width
             current_time = time.time()
+            self._frame_counter += 1
 
             active = tracker_mgr.update_all(frame, current_time)
 
@@ -164,43 +193,61 @@ class VisionPipeline:
 
                 last_detection_time = current_time
 
-            # === ANNOTATION (stream only — after all analysis on clean frame) ===
-            for t in active:
-                t_user = t["user"]
-                tx, ty, tw, th = t["bbox"]
-                color = (0, 0, 255) if t_user == "Unknown" else (0, 255, 0)
-                if t_user == "Identifying...":
-                    color = (255, 0, 0)
-                cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th), color, 2)
-                cv2.putText(frame, f"ID: {t_user}", (tx, ty - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            faces = self._build_faces(tracker_mgr.snapshot, frame_w, frame_h)
+            fall_state = {
+                "status": fall_det.status,
+                "confidence": fall_det.confidence,
+                "verifying": fall_det.is_verifying,
+                "elapsed": fall_det.verification_elapsed,
+            }
+            state = VisionState(
+                ts=current_time,
+                fid=self._frame_counter,
+                fps=self._estimate_fps(current_time),
+                pw=frame_w,
+                ph=frame_h,
+                faces=faces,
+                gesture=gesture_rec.latest_gesture,
+                fall=fall_state,
+                ir=pkt.ir_mode,
+            )
+            ws_server.update_state(state)
 
-            if gesture_rec.latest_gesture:
-                cv2.putText(frame, f"Gesture: {gesture_rec.latest_gesture}",
-                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    @staticmethod
+    def _build_faces(snapshot, frame_w, frame_h):
+        faces = []
+        if frame_w <= 0 or frame_h <= 0:
+            return faces
 
-            if fall_det.is_verifying:
-                elapsed = fall_det.verification_elapsed
-                cv2.putText(frame,
-                            f"VERIFYING FALL ({elapsed:.1f}s/{cfg.post_fall_wait}s)",
-                            (20, frame_h - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-            elif fall_det.status == "FALL CONFIRMED":
-                cv2.putText(frame,
-                            f"FALL CONFIRMED ({fall_det.confidence:.0%})",
-                            (20, frame_h - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-            elif fall_det.status and fall_det.status not in ("Standing", ""):
-                cv2.putText(frame, fall_det.status, (20, frame_h - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        for tracker_id, data in snapshot.items():
+            x, y, w, h = data["bbox"]
+            x1 = max(0.0, min(float(frame_w), float(x)))
+            y1 = max(0.0, min(float(frame_h), float(y)))
+            x2 = max(0.0, min(float(frame_w), float(x + w)))
+            y2 = max(0.0, min(float(frame_h), float(y + h)))
+            faces.append(TrackedFace(
+                id=tracker_id,
+                user=data["user"],
+                nx=x1 / frame_w,
+                ny=y1 / frame_h,
+                nw=(x2 - x1) / frame_w,
+                nh=(y2 - y1) / frame_h,
+            ))
+        return faces
 
-            # === ENCODE & STREAM ===
-            try:
-                ret, buffer = cv2.imencode('.jpg', frame)
-                if ret:
-                    server.update_frame(buffer.tobytes())
-            except Exception as e:
-                logger.error("JPEG encode error: {}", e)
+    def _estimate_fps(self, current_time):
+        if self._last_state_time <= 0:
+            self._last_state_time = current_time
+            return 0.0
+
+        delta = current_time - self._last_state_time
+        self._last_state_time = current_time
+        if delta <= 0:
+            return self._fps
+
+        instant_fps = 1.0 / delta
+        self._fps = instant_fps if self._fps <= 0 else (self._fps * 0.8 + instant_fps * 0.2)
+        return self._fps
 
 
 def main():

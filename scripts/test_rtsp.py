@@ -2,7 +2,7 @@
 
 Tests:
   1. .env loading and URL construction
-  2. TCP RTSP connection to stream2 (480p)
+  2. TCP RTSP connection to stream2 (720p on Tapo C225)
   3. Frame capture and IR detection
   4. On-demand hires capture from stream1 (2K)
 
@@ -34,12 +34,12 @@ def main():
         )
         sys.exit(1)
 
-    logger.info("RTSP URL (480p): {}", cfg.rtsp_url)
+    logger.info("RTSP URL (720p): {}", cfg.rtsp_url)
     logger.info("RTSP URL (2K):   {}", cfg.rtsp_hires_url)
     logger.success("Config OK ✓")
 
-    # --- Step 2: TCP RTSP connection (stream2 — 480p) ---
-    logger.info("\n=== Step 2: RTSP TCP Connection (stream2, 480p) ===")
+    # --- Step 2: TCP RTSP connection (stream2 — 720p on Tapo C225) ---
+    logger.info("\n=== Step 2: RTSP TCP Connection (stream2, 720p) ===")
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
     t0 = time.time()
@@ -73,7 +73,7 @@ def main():
         )
 
     cap.release()
-    logger.success("Stream2 (480p) capture OK ✓")
+    logger.success("Stream2 (720p) capture OK ✓")
 
     # --- Step 4: Hires capture (stream1 — 2K) ---
     logger.info("\n=== Step 4: Hires Capture Test (stream1, 2K) ===")

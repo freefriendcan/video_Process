@@ -16,7 +16,7 @@ from config import PipelineConfig
 class FrameProducer:
     """RTSP capture with dedicated thread, bounded queue, and auto-reconnect.
 
-    Reads from Tapo C225 stream2 (480p) continuously on a daemon thread.
+    Reads from Tapo C225 stream2 (720p) continuously on a daemon thread.
     Produces ``FramePacket`` objects with pre-computed RGB and IR flag.
 
     On-demand ``capture_hires()`` opens stream1 (2K) for a single frame
@@ -29,7 +29,9 @@ class FrameProducer:
         self._queue: queue.Queue[FramePacket] = queue.Queue(maxsize=2)
         self._cap: Optional[cv2.VideoCapture] = None
         self._running = False
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._last_frame_time = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -42,6 +44,7 @@ class FrameProducer:
                 "RTSP URL not configured. Set TAPO_IP, TAPO_USER, TAPO_PASS "
                 "environment variables or provide rtsp_url in PipelineConfig."
             )
+        self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(
             target=self._capture_loop, daemon=True, name="rtsp-capture"
@@ -91,6 +94,12 @@ class FrameProducer:
         logger.debug("Captured hires frame {}×{}", frame.shape[1], frame.shape[0])
         return frame
 
+    @property
+    def last_frame_age(self) -> Optional[float]:
+        if self._last_frame_time <= 0:
+            return None
+        return time.time() - self._last_frame_time
+
     def release(self):
         """Stop capture thread and release resources.
 
@@ -100,6 +109,7 @@ class FrameProducer:
         thread-safe at the C++ level.
         """
         self._running = False
+        self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10.0)
             if self._thread.is_alive():
@@ -122,13 +132,14 @@ class FrameProducer:
         delay = self._cfg.rtsp_reconnect_delay
 
         try:
-            while self._running:
+            while self._running and not self._stop_event.is_set():
                 self._cap = self._connect()
                 if self._cap is None:
                     logger.warning(
                         "RTSP connection failed, retrying in {:.1f}s...", delay
                     )
-                    time.sleep(delay)
+                    if self._stop_event.wait(delay):
+                        break
                     delay = min(delay * 2, self._cfg.rtsp_max_reconnect_delay)
                     continue
 
@@ -153,7 +164,7 @@ class FrameProducer:
         """Read frames until the stream drops or we're told to stop."""
         consecutive_failures = 0
 
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             ok, bgr = self._cap.read()
             if not ok:
                 consecutive_failures += 1
@@ -163,17 +174,19 @@ class FrameProducer:
                         consecutive_failures,
                     )
                     return
-                time.sleep(0.01)
+                if self._stop_event.wait(0.01):
+                    return
                 continue
 
             consecutive_failures = 0
+            self._last_frame_time = time.time()
             h, w = bgr.shape[:2]
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             ir = self._ir_detector.is_ir_mode(bgr)
 
             pkt = FramePacket(
                 bgr=bgr, rgb=rgb, ir_mode=ir,
-                timestamp=time.time(), width=w, height=h,
+                timestamp=self._last_frame_time, width=w, height=h,
             )
 
             # Drop-oldest when full — always keep the freshest frame

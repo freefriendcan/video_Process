@@ -28,27 +28,33 @@ classifiers = [
 dependencies = [
     # Core CV
     "opencv-python>=4.8.0",
-    "mediapipe>=0.10.14",
+    "mediapipe==0.10.14",
     "numpy>=1.24.0",
 
     # TFLite Runtime (fall detection transformer)
     "ai-edge-litert>=2.1.0",
 
     # Streaming
-    "flask>=3.0.0",
+    "websockets>=12.0",
 
     # HTTP client (agent communication)
     "requests>=2.31.0",
+
+    # Config
+    "python-dotenv>=1.0.0",
 
     # Future use (ByteTrack, on-device face recognition)
     "ultralytics>=8.0.0",
     "torch>=2.0.0",
     "deepface>=0.0.80",
-    "onnxruntime>=1.16.0",
+    "onnxruntime>=1.16.0,<1.24.0",
+    "face-alignment>=1.4.0",
+    "scikit-image>=0.21.0",
 
     # Utilities
     "pillow>=10.0.0",
     "loguru>=0.7.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +70,22 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/yourusername/video_Process"
 Repository = "https://github.com/yourusername/video_Process"
+
+[tool.setuptools]
+py-modules = ["config", "main", "mac_camera"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "capture*",
+    "detection*",
+    "events*",
+    "identification*",
+    "quality*",
+    "streaming*",
+    "tracking*",
+]
+exclude = ["data*", "go2rtc*", "scripts*", "tests*"]
 
 [tool.black]
 line-length = 100

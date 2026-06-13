@@ -12,7 +12,7 @@ Kaynak: Birleşik — Rapor 2 (producer-consumer + tek RGB dönüşümü) ile Ra
 Gerekçe: Raporlar arasındaki merkezi çatışma budur. Rapor 2 ve 3 saf threading önerir; Rapor 1 tam multi-process actor modeli önerir. Threading tek başına teknik olarak yetersizdir: MediaPipe'ın C++ katmanı GIL'i serbest bırakırken, çevreleyen NumPy, cv2.imencode ve dict işlemleri bırakmaz — bu da ana döngüde head-of-line blocking yaratır. Ancak her aşama için ayrı process (Rapor 1) gereksiz mühendislik karmaşıklığı taşır. Hibrit yaklaşım her aşama için en ucuz doğru çözümü seçer: I/O-bound aşamalar için thread, GIL'in gerçekten ısırdığı düşme tespiti için process.
 
 Alan 2 — Kamera Yakalama ve Gece Görüşü (IR) Yönetimi
-Seçilen Yaklaşım: Yerel cv2.VideoCapture(0) webcam'i, Tapo C225 RTSP feed'i ile değiştir. Çift akış stratejisi: 480p alt akış (/stream2) tüm ML inference için, 2K ana akış (/stream1) yalnızca düşme anında tam çözünürlük ekran görüntüsü için. Otomatik yeniden bağlanma mantığı ve CAP_PROP_BUFFERSIZE=1 ile latansı minimize et. Kritik olarak: IR/gece görüşü modunu kanal ortalamaları üzerinden standart sapma ile tespit et (R≈G≈B ⇒ gri tonlama ⇒ IR), parlaklık kapılarını IR'ye özgü eşiklere çevir ve ir_mode flag'ini downstream'e taşı.
+Seçilen Yaklaşım: Yerel cv2.VideoCapture(0) webcam'i, Tapo C225 RTSP feed'i ile değiştir. Çift akış stratejisi: 720p alt akış (/stream2) tüm ML inference için, 2K ana akış (/stream1) yalnızca düşme anında tam çözünürlük ekran görüntüsü için. Otomatik yeniden bağlanma mantığı ve CAP_PROP_BUFFERSIZE=1 ile latansı minimize et. Kritik olarak: IR/gece görüşü modunu kanal ortalamaları üzerinden standart sapma ile tespit et (R≈G≈B ⇒ gri tonlama ⇒ IR), parlaklık kapılarını IR'ye özgü eşiklere çevir ve ir_mode flag'ini downstream'e taşı.
 Kaynak: Rapor 1, buffer optimizasyonu Rapor 3 tarafından doğrulanmış.
 Gerekçe: En net tek-rapor kazanımı. Rapor 2 hâlâ yerel webcam'i hedefler; Rapor 3 RTSP'yi ele alır ama gece görüşünü yok sayar. Yalnızca Rapor 1, C225'in 940nm IR modunun mevcut MIN_BRIGHTNESS/MAX_BRIGHTNESS kalite kapısını sessizce bozacağını ve RGB-eğitimli yüz tanımanın doğruluğunu düşüreceğini tespit eder. Düşmelerin en yüksek riskli ve en az gözlemlenen olduğu gece saatlerinde çalışması gereken bir güvenlik sistemi için IR yönetimi opsiyonel değil, temel doğruluktur. Yüksek etki, orta fizibilite, donanım fiziğine dayalı benzersiz kanıt.
 Not: Bu iyileştirme Aşama B'de gelir — Aşama A'da mevcut webcam yakalama mantığı aynen korunur, yalnızca bağımsız bir capture/ modülüne çıkarılır.
@@ -106,8 +106,8 @@ from dataclasses import dataclass
 @dataclass
 class PipelineConfig:
     camera_index: int = 0
-    frame_width: int = 640
-    frame_height: int = 480
+    frame_width: int = 1280
+    frame_height: int = 720
     face_detection_interval: float = 0.15
     fall_target_fps: float = 15.0
     fall_confidence_threshold: float = 0.90

@@ -1,0 +1,20 @@
+log:
+  level: info
+
+api:
+  listen: ":1984"
+  origin: "*"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555"
+  candidates:
+    - ${GO2RTC_WEBRTC_CANDIDATE}
+
+streams:
+  # Computer vision input: Tapo C225 stream2, lowest RTSP profile, typically 720p.
+  living_room_sd: rtsp://${TAPO_USER}:${TAPO_PASS}@${TAPO_IP}:554/stream2
+  # Dashboard video and hires captures: Tapo C225 high-resolution profile.
+  living_room_hd: rtsp://${TAPO_USER}:${TAPO_PASS}@${TAPO_IP}:554/stream1
