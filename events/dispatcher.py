@@ -1,8 +1,8 @@
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
-import requests
+import requests  # type: ignore[import-untyped]
 from loguru import logger
 
 from config import PipelineConfig
@@ -20,24 +20,9 @@ class EventDispatcher:
     def shutdown(self, wait=False):
         self._executor.shutdown(wait=wait)
 
-    def send_fall_alert(self, confidence, screenshot_path=None):
+    def send_fall_alert(self, payload: Mapping[str, object]) -> None:
         try:
-            payload = {
-                "event": "fall_detected",
-                "confidence": round(confidence, 4),
-                "timestamp": time.time(),
-                "source": "mac_camera",
-                "method": "transformer",
-            }
-
-            if screenshot_path and Path(screenshot_path).exists():
-                with open(screenshot_path, 'rb') as f:
-                    files = {'screenshot': (Path(screenshot_path).name, f, 'image/jpeg')}
-                    data = {k: str(v) for k, v in payload.items()}
-                    resp = requests.post(self._cfg.fall_alert_url, data=data, files=files, timeout=5.0)
-            else:
-                resp = requests.post(self._cfg.fall_alert_url, json=payload, timeout=3.0)
-
+            resp = requests.post(self._cfg.fall_alert_url, json=dict(payload), timeout=3.0)
             logger.info("Fall alert sent to backend: {}", resp.status_code)
         except Exception as e:
             logger.error("Fall alert send error: {}", e)
