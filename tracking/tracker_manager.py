@@ -1,17 +1,100 @@
+from __future__ import annotations
+
 import threading
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol, cast
 
 import cv2
+import numpy as np
 from loguru import logger
 
 from config import PipelineConfig
+
+BBox = tuple[int, int, int, int]
+PersonDetection = tuple[BBox, float]
+
+
+@dataclass
+class PersonTrackRecord:
+    track_id: int
+    bbox: BBox
+    user: str
+    reid_ok: bool
+    last_seen: float
+    confidence: float
+
+
+class _CvTracker(Protocol):
+    def init(self, image: np.ndarray, bounding_box: BBox) -> bool:
+        ...
+
+    def update(self, image: np.ndarray) -> tuple[bool, tuple[float, float, float, float]]:
+        ...
+
+
+class _MotTracker(Protocol):
+    def update(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        embs: np.ndarray | None = None,
+    ) -> np.ndarray:
+        ...
 
 
 class TrackerManager:
     def __init__(self, cfg: PipelineConfig):
         self._cfg = cfg
-        self._trackers = {}
+        self._trackers: dict[int, dict[str, Any]] = {}
+        self._person_tracks: dict[int, PersonTrackRecord] = {}
+        self._person_reid_enabled = cfg.tracker_type.lower() == "botsort"
+        self._person_mot = self._build_person_tracker(cfg)
         self._lock = threading.Lock()
         self._next_id = 0
+
+    @staticmethod
+    def _build_person_tracker(cfg: PipelineConfig) -> _MotTracker:
+        tracker_type = cfg.tracker_type.strip().lower()
+        if tracker_type == "botsort":
+            from boxmot.reid.core import ReID
+            from boxmot.trackers import BotSort
+
+            reid_model = ReID(device=cfg.reid_device, half=cfg.reid_half).model
+            tracker = BotSort(
+                reid_model=reid_model,
+                track_high_thresh=cfg.person_conf_threshold,
+                track_low_thresh=cfg.tracker_low_conf,
+                new_track_thresh=cfg.tracker_new_track_thresh,
+                track_buffer=cfg.tracker_track_buffer,
+                match_thresh=cfg.tracker_match_thresh,
+                proximity_thresh=cfg.tracker_proximity_thresh,
+                appearance_thresh=cfg.tracker_appearance_thresh,
+                cmc_method=cfg.tracker_cmc_method,
+                frame_rate=cfg.tracker_frame_rate,
+                with_reid=True,
+                per_class=False,
+                min_hits=1,
+            )
+            logger.info("Person tracker initialized: BoT-SORT + ReID ({})", cfg.reid_device)
+            return cast(_MotTracker, tracker)
+
+        if tracker_type == "bytetrack":
+            from boxmot.trackers import ByteTrack
+
+            tracker = ByteTrack(
+                min_conf=cfg.tracker_low_conf,
+                track_thresh=cfg.person_conf_threshold,
+                match_thresh=cfg.tracker_match_thresh,
+                track_buffer=cfg.tracker_track_buffer,
+                frame_rate=cfg.tracker_frame_rate,
+                per_class=False,
+                min_hits=1,
+            )
+            logger.warning("Person tracker initialized: ByteTrack fallback (no ReID)")
+            return cast(_MotTracker, tracker)
+
+        raise ValueError("tracker_type must be 'botsort' or 'bytetrack'")
 
     @staticmethod
     def get_center(bbox):
@@ -19,19 +102,19 @@ class TrackerManager:
         return (x + w / 2, y + h / 2)
 
     @staticmethod
-    def calculate_iou(boxA, boxB):
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
-        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    def calculate_iou(box_a, box_b):
+        x_a = max(box_a[0], box_b[0])
+        y_a = max(box_a[1], box_b[1])
+        x_b = min(box_a[0] + box_a[2], box_b[0] + box_b[2])
+        y_b = min(box_a[1] + box_a[3], box_b[1] + box_b[3])
 
-        interArea = max(0, xB - xA) * max(0, yB - yA)
-        boxAArea = boxA[2] * boxA[3]
-        boxBArea = boxB[2] * boxB[3]
+        inter_area = max(0, x_b - x_a) * max(0, y_b - y_a)
+        box_a_area = box_a[2] * box_a[3]
+        box_b_area = box_b[2] * box_b[3]
 
-        if boxAArea + boxBArea - interArea == 0:
+        if box_a_area + box_b_area - inter_area == 0:
             return 0.0
-        return interArea / float(boxAArea + boxBArea - interArea)
+        return inter_area / float(box_a_area + box_b_area - inter_area)
 
     def update_all(self, frame, current_time):
         """Update all KCF trackers. Evicts TTL-expired and lost trackers.
@@ -106,7 +189,7 @@ class TrackerManager:
                             matched_id = t_id
 
             if matched_id is not None:
-                new_tracker = cv2.TrackerKCF_create()
+                new_tracker = self._new_kcf_tracker()
                 new_tracker.init(frame, (x, y, w, h))
                 with self._lock:
                     if matched_id in self._trackers:
@@ -116,7 +199,7 @@ class TrackerManager:
                         self._trackers[matched_id]["last_blazeface_update"] = current_time
             else:
                 logger.info("New face detected — tracking initiated (ID: {})", self._next_id)
-                tracker = cv2.TrackerKCF_create()
+                tracker = self._new_kcf_tracker()
                 tracker.init(frame, (x, y, w, h))
 
                 tracker_id = self._next_id
@@ -143,6 +226,100 @@ class TrackerManager:
 
         return new_faces
 
+    def update_person_tracks(
+        self,
+        person_dets: Sequence[PersonDetection],
+        frame: np.ndarray,
+        current_time: float,
+    ) -> list[dict[str, object]]:
+        """Update MOT-backed person tracks from detector outputs.
+
+        ``person_dets`` may be empty on non-detection frames. BoxMOT still
+        advances its Kalman state; this manager retains the last emitted bbox
+        for the configured track buffer so fall/identity state is not pruned
+        between detector passes.
+        """
+        det_array = self._person_detections_to_boxmot(person_dets)
+        results = np.asarray(self._person_mot.update(det_array, frame), dtype=np.float32)
+        self._apply_person_results(results, current_time)
+        self._evict_stale_person_tracks(current_time)
+        return self.active_person_tracks
+
+    @staticmethod
+    def _person_detections_to_boxmot(person_dets: Sequence[PersonDetection]) -> np.ndarray:
+        if not person_dets:
+            return np.empty((0, 6), dtype=np.float32)
+
+        rows: list[tuple[float, float, float, float, float, float]] = []
+        for bbox, confidence in person_dets:
+            x, y, w, h = bbox
+            rows.append(
+                (
+                    float(x),
+                    float(y),
+                    float(x + w),
+                    float(y + h),
+                    float(confidence),
+                    0.0,
+                )
+            )
+        return np.asarray(rows, dtype=np.float32)
+
+    def _apply_person_results(self, results: np.ndarray, current_time: float) -> None:
+        if results.size == 0:
+            return
+        if results.ndim == 1:
+            results = results.reshape(1, -1)
+
+        for row in results:
+            if row.shape[0] < 8:
+                logger.warning("Unexpected BoxMOT person track row shape: {}", row.shape)
+                continue
+
+            track_id = int(row[4])
+            confidence = float(row[5])
+            bbox = self._xyxy_to_bbox(row[:4])
+            with self._lock:
+                existing = self._person_tracks.get(track_id)
+                user = existing.user if existing is not None else "Unknown"
+                self._person_tracks[track_id] = PersonTrackRecord(
+                    track_id=track_id,
+                    bbox=bbox,
+                    user=user,
+                    reid_ok=self._person_reid_enabled,
+                    last_seen=current_time,
+                    confidence=confidence,
+                )
+
+    @staticmethod
+    def _xyxy_to_bbox(values: np.ndarray) -> BBox:
+        x1, y1, x2, y2 = [float(value) for value in values[:4]]
+        x = int(round(min(x1, x2)))
+        y = int(round(min(y1, y2)))
+        w = int(round(abs(x2 - x1)))
+        h = int(round(abs(y2 - y1)))
+        return x, y, w, h
+
+    def _evict_stale_person_tracks(self, current_time: float) -> None:
+        ttl = max(
+            self._cfg.person_detection_interval * 2.0,
+            self._cfg.tracker_track_buffer / max(1.0, float(self._cfg.tracker_frame_rate)),
+        )
+        with self._lock:
+            stale_track_ids = [
+                track_id
+                for track_id, record in self._person_tracks.items()
+                if current_time - record.last_seen > ttl
+            ]
+            for track_id in stale_track_ids:
+                logger.debug("[person:{}] MOT track expired — removing identity state", track_id)
+                del self._person_tracks[track_id]
+
+    @staticmethod
+    def _new_kcf_tracker() -> _CvTracker:
+        factory = getattr(cv2, "TrackerKCF_create")
+        return cast(_CvTracker, factory())
+
     def set_user(self, tracker_id, user, retry_count=None, increment_retry=False):
         """Thread-safe user update. Returns current retry_count, or None if tracker gone."""
         with self._lock:
@@ -161,6 +338,64 @@ class TrackerManager:
             if tracker_id in self._trackers:
                 self._trackers[tracker_id].update(fields)
 
+    def propagate_identity(self) -> None:
+        """Stamp recognized face identities onto containing person tracks."""
+        with self._lock:
+            face_snapshot = {
+                track_id: dict(data)
+                for track_id, data in self._trackers.items()
+            }
+            person_snapshot = dict(self._person_tracks)
+
+        for face_data in face_snapshot.values():
+            user = str(face_data.get("user", "Unknown"))
+            if user in {"Unknown", "Identifying..."}:
+                continue
+
+            face_bbox = cast(BBox, face_data["bbox"])
+            face_center = self.get_center(face_bbox)
+            matched_person_id: int | None = None
+            matched_ratio = -1.0
+
+            for person_id, person_record in person_snapshot.items():
+                if not self._bbox_contains_point(person_record.bbox, face_center):
+                    continue
+                ratio = self._containment_ratio(face_bbox, person_record.bbox)
+                if ratio > matched_ratio:
+                    matched_person_id = person_id
+                    matched_ratio = ratio
+
+            if matched_person_id is None:
+                continue
+
+            with self._lock:
+                record = self._person_tracks.get(matched_person_id)
+                if record is not None and record.user != user:
+                    record.user = user
+                    logger.info(
+                        "[person:{}] Identity propagated from face track: {}",
+                        matched_person_id,
+                        user,
+                    )
+
+    @staticmethod
+    def _bbox_contains_point(bbox: BBox, point: tuple[float, float]) -> bool:
+        x, y, w, h = bbox
+        px, py = point
+        return x <= px <= x + w and y <= py <= y + h
+
+    @staticmethod
+    def _containment_ratio(inner: BBox, outer: BBox) -> float:
+        ix, iy, iw, ih = inner
+        ox, oy, ow, oh = outer
+        inter_x1 = max(ix, ox)
+        inter_y1 = max(iy, oy)
+        inter_x2 = min(ix + iw, ox + ow)
+        inter_y2 = min(iy + ih, oy + oh)
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        inner_area = max(1, iw * ih)
+        return inter_area / float(inner_area)
+
     def get_active_user(self):
         """Returns the first identified user name, or 'Unknown'."""
         with self._lock:
@@ -172,6 +407,36 @@ class TrackerManager:
     def exists(self, tracker_id):
         with self._lock:
             return tracker_id in self._trackers
+
+    @property
+    def active_person_tracks(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [
+                {
+                    "id": record.track_id,
+                    "bbox": record.bbox,
+                    "user": record.user,
+                    "reid_ok": record.reid_ok,
+                    "last_seen": record.last_seen,
+                    "confidence": record.confidence,
+                }
+                for record in sorted(self._person_tracks.values(), key=lambda item: item.track_id)
+            ]
+
+    @property
+    def person_snapshot(self) -> dict[int, dict[str, object]]:
+        with self._lock:
+            return {
+                record.track_id: {
+                    "id": record.track_id,
+                    "bbox": record.bbox,
+                    "user": record.user,
+                    "reid_ok": record.reid_ok,
+                    "last_seen": record.last_seen,
+                    "confidence": record.confidence,
+                }
+                for record in self._person_tracks.values()
+            }
 
     @property
     def snapshot(self):

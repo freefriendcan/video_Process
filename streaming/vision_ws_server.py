@@ -4,10 +4,9 @@ import asyncio
 import json
 import threading
 import time
-from typing import Optional
 
 from loguru import logger
-from websockets.server import WebSocketServerProtocol, serve
+from websockets.server import WebSocketServerProtocol, serve  # type: ignore[attr-defined]
 
 from config import PipelineConfig
 from streaming.vision_state import VisionState
@@ -22,12 +21,12 @@ class VisionWSServer:
         self._port = cfg.ws_vision_port
         self._min_interval = 1.0 / cfg.ws_vision_fps if cfg.ws_vision_fps > 0 else 0.0
         self._clients: set[WebSocketServerProtocol] = set()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._stop_future: Optional[asyncio.Future] = None
-        self._thread: Optional[threading.Thread] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_future: asyncio.Future | None = None
+        self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._lock = threading.Lock()
-        self._latest_json: Optional[str] = None
+        self._latest_json: str | None = None
         self._last_broadcast_time = 0.0
 
     def start(self):
