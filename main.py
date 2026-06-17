@@ -2,14 +2,34 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Mapping, Sequence
+from typing import cast
 
+import numpy as np
 from loguru import logger
+
+from capture.frame_producer import FrameProducer
+from config import PipelineConfig
+from detection.face_detector import FaceDetector
+from detection.fall_detector import FallDetector
+from detection.gesture_recognizer import GestureRecognizer
+from detection.onnx_runtime import BBox, NormalizedKeypoint
+from detection.person_detector import PersonDetection, PersonDetector
+from events.dispatcher import EventDispatcher
+from identification.face_identifier import FaceIdentifier
+from quality.face_quality_gate import FaceQualityGate
+from streaming.vision_state import TrackedFace, TrackedPerson, VisionState
+from streaming.vision_ws_server import VisionWSServer
+from tracking.tracker_manager import TrackerManager
 
 # Configure loguru: remove default handler, add custom sinks
 logger.remove()
 logger.add(
     sys.stderr,
-    format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+    format=(
+        "<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
+    ),
     level="DEBUG",
     colorize=True,
 )
@@ -23,19 +43,6 @@ logger.add(
 )
 
 
-from config import PipelineConfig
-from quality.face_quality_gate import FaceQualityGate
-from events.dispatcher import EventDispatcher
-from detection.face_detector import FaceDetector
-from detection.gesture_recognizer import GestureRecognizer
-from detection.fall_detector import FallDetector
-from tracking.tracker_manager import TrackerManager
-from identification.face_identifier import FaceIdentifier
-from capture.frame_producer import FrameProducer
-from streaming.vision_state import TrackedFace, VisionState
-from streaming.vision_ws_server import VisionWSServer
-
-
 class VisionPipeline:
     def __init__(self, cfg: PipelineConfig):
         self._cfg = cfg
@@ -44,8 +51,13 @@ class VisionPipeline:
         self._tracker_mgr = TrackerManager(cfg)
         self._producer = FrameProducer(cfg)
         self._ws_server = VisionWSServer(cfg)
+        self._person_det = PersonDetector(cfg)
         self._face_det = FaceDetector(cfg)
-        self._gesture_rec = GestureRecognizer(cfg, self._dispatcher, self._tracker_mgr.get_active_user)
+        self._gesture_rec = GestureRecognizer(
+            cfg,
+            self._dispatcher,
+            self._tracker_mgr.get_active_user,
+        )
         self._fall_det = FallDetector(cfg)
         self._identifier = FaceIdentifier(cfg, self._tracker_mgr)
         self._frame_counter = 0
@@ -97,18 +109,18 @@ class VisionPipeline:
         sys.exit(0)
 
     def _camera_loop(self):
-        cfg = self._cfg
         quality_gate = self._quality_gate
         dispatcher = self._dispatcher
         tracker_mgr = self._tracker_mgr
         gesture_rec = self._gesture_rec
         fall_det = self._fall_det
+        person_det = self._person_det
         face_det = self._face_det
-        identifier = self._identifier
         producer = self._producer
         ws_server = self._ws_server
 
         last_detection_time = 0
+        last_person_detection_time = 0.0
 
         while self._running:
             pkt = producer.read_latest()
@@ -128,77 +140,70 @@ class VisionPipeline:
                 x, y, w, h = t["bbox"]
                 user = t["user"]
                 if user not in ["Unknown", "Identifying..."]:
-                    is_frontal = quality_gate.estimate_frontality(t["detection_keypoints"], frame_w, frame_h, (x, y, w, h))
+                    is_frontal = quality_gate.estimate_frontality(
+                        t["detection_keypoints"],
+                        frame_w,
+                        frame_h,
+                        (x, y, w, h),
+                    )
                     gesture_rec.is_frontal = is_frontal
 
                     if current_time - t["last_json_time"] > 3.0:
                         dispatcher.submit(dispatcher.send_presence, user)
                         tracker_mgr.update_field(t_id, last_json_time=current_time)
 
-                if user == "Unknown" and t["retry_count"] < cfg.max_retries:
-                    face_roi = frame[max(0, y):y+h, max(0, x):x+w]
-
-                    if face_roi.size > 0:
-                        passed, current_quality = quality_gate.check(
-                            face_roi, t["detection_keypoints"], frame_w, frame_h,
-                            (x, y, w, h), ir_mode=pkt.ir_mode
-                        )
-                        if passed:
-                            cooldown = 2.0 * (2 ** t["retry_count"])
-                            time_ok = (current_time - t["last_identify_time"]) > cooldown
-                            quality_ok = current_quality > t["best_quality_score"] * 0.8
-
-                            if time_ok and quality_ok:
-                                logger.info("[{}] Quality OK, retrying identification (attempt {}/{})", t_id, t['retry_count']+1, cfg.max_retries)
-                                tracker_mgr.update_field(
-                                    t_id,
-                                    user="Identifying...",
-                                    last_identify_time=current_time,
-                                    best_quality_score=max(t["best_quality_score"], current_quality),
-                                )
-
-                                roi_copy = face_roi.copy()
-                                dispatcher.submit(identifier.identify, roi_copy, t_id)
-
             rgb_frame = pkt.rgb
 
-            gesture_rec.process(rgb_frame, current_time)
+            person_dets: list[PersonDetection] = []
+            if current_time - last_person_detection_time > self._cfg.person_detection_interval:
+                person_dets = person_det.detect(rgb_frame)
+                last_person_detection_time = current_time
+            person_tracks = tracker_mgr.update_person_tracks(person_dets, frame, current_time)
 
+            active_person_ids = {int(person_track["id"]) for person_track in person_tracks}
+            fall_det.sync_tracks(active_person_ids)
+
+            pose_tracks = []
+            for person_track in person_tracks:
+                person_track_id = int(person_track["id"])
+                person_bbox = cast(BBox, person_track["bbox"])
+                fall_result = fall_det.process_track(
+                    track_id=person_track_id,
+                    rgb_frame=rgb_frame,
+                    bgr_frame=frame,
+                    bbox=person_bbox,
+                    frame_size=(frame_w, frame_h),
+                    current_time=current_time,
+                )
+                if fall_result.pose is not None:
+                    pose_tracks.append(fall_result.pose)
+                if fall_result.alert is not None:
+                    dispatcher.submit(dispatcher.send_fall_alert, fall_result.alert)
+
+            gesture_rec.process(rgb_frame, current_time, pose_tracks)
             gesture_rec.clear_stale(current_time)
-
-            fall_result = fall_det.process_frame(rgb_frame, frame, current_time)
-            if fall_result:
-                conf, screenshot_path = fall_result
-                dispatcher.submit(dispatcher.send_fall_alert, conf, screenshot_path)
-
 
             if current_time - last_detection_time > 0.15:
                 faces = face_det.detect(rgb_frame)
                 new_faces = tracker_mgr.match_and_update(faces, frame, current_time)
-
-                for nf in new_faces:
-                    t_id = nf["tracker_id"]
-                    x, y, w, h = nf["bbox"]
-                    face_roi = frame[max(0, y):y+h, max(0, x):x+w]
-                    if face_roi.size > 0:
-                        passed, _ = quality_gate.check(
-                            face_roi, nf["keypoints"], frame_w, frame_h,
-                            (x, y, w, h), ir_mode=pkt.ir_mode
-                        )
-                        if passed:
-                            roi_copy = face_roi.copy()
-                            dispatcher.submit(identifier.identify, roi_copy, t_id)
-                        else:
-                            tracker_mgr.set_user(t_id, "Unknown")
+                self._identify_new_faces(
+                    new_faces=new_faces,
+                    frame=frame,
+                    frame_size=(frame_w, frame_h),
+                    ir_mode=pkt.ir_mode,
+                )
 
                 last_detection_time = current_time
 
+            tracker_mgr.propagate_identity()
             faces = self._build_faces(tracker_mgr.snapshot, frame_w, frame_h)
+            persons = self._build_persons(tracker_mgr.person_snapshot, frame_w, frame_h)
             fall_state = {
                 "status": fall_det.status,
                 "confidence": fall_det.confidence,
                 "verifying": fall_det.is_verifying,
                 "elapsed": fall_det.verification_elapsed,
+                "tracks": fall_det.track_statuses,
             }
             state = VisionState(
                 ts=current_time,
@@ -207,33 +212,106 @@ class VisionPipeline:
                 pw=frame_w,
                 ph=frame_h,
                 faces=faces,
+                persons=persons,
                 gesture=gesture_rec.latest_gesture,
                 fall=fall_state,
                 ir=pkt.ir_mode,
             )
             ws_server.update_state(state)
 
+    def _identify_new_faces(
+        self,
+        new_faces: Sequence[Mapping[str, object]],
+        frame: np.ndarray,
+        frame_size: tuple[int, int],
+        ir_mode: bool,
+    ) -> None:
+        frame_w, frame_h = frame_size
+        for new_face in new_faces:
+            tracker_id = cast(int, new_face["tracker_id"])
+            x, y, w, h = cast(BBox, new_face["bbox"])
+            if ir_mode:
+                logger.info("[{}] IR mode active; local ArcFace identify skipped", tracker_id)
+                self._tracker_mgr.set_user(tracker_id, "Unknown")
+                continue
+
+            face_roi = frame[max(0, y) : y + h, max(0, x) : x + w]
+            if face_roi.size <= 0:
+                self._tracker_mgr.set_user(tracker_id, "Unknown")
+                continue
+
+            keypoints = cast(Sequence[NormalizedKeypoint], new_face["keypoints"])
+            passed, _score = self._quality_gate.check(
+                face_roi,
+                keypoints,
+                frame_w,
+                frame_h,
+                (x, y, w, h),
+                ir_mode=False,
+            )
+            if not passed:
+                self._tracker_mgr.set_user(tracker_id, "Unknown")
+                continue
+
+            roi_copy = face_roi.copy()
+            crop_keypoints = self._identifier.crop_keypoints(
+                keypoints,
+                (x, y, w, h),
+                (frame_w, frame_h),
+            )
+            self._dispatcher.submit(self._identifier.identify, roi_copy, crop_keypoints, tracker_id)
+
     @staticmethod
-    def _build_faces(snapshot, frame_w, frame_h):
-        faces = []
+    def _build_faces(
+        snapshot: Mapping[int, Mapping[str, object]],
+        frame_w: int,
+        frame_h: int,
+    ) -> list[TrackedFace]:
+        faces: list[TrackedFace] = []
         if frame_w <= 0 or frame_h <= 0:
             return faces
 
         for tracker_id, data in snapshot.items():
-            x, y, w, h = data["bbox"]
+            x, y, w, h = cast(BBox, data["bbox"])
             x1 = max(0.0, min(float(frame_w), float(x)))
             y1 = max(0.0, min(float(frame_h), float(y)))
             x2 = max(0.0, min(float(frame_w), float(x + w)))
             y2 = max(0.0, min(float(frame_h), float(y + h)))
             faces.append(TrackedFace(
                 id=tracker_id,
-                user=data["user"],
+                user=str(data["user"]),
                 nx=x1 / frame_w,
                 ny=y1 / frame_h,
                 nw=(x2 - x1) / frame_w,
                 nh=(y2 - y1) / frame_h,
             ))
         return faces
+
+    @staticmethod
+    def _build_persons(
+        snapshot: Mapping[int, Mapping[str, object]],
+        frame_w: int,
+        frame_h: int,
+    ) -> list[TrackedPerson]:
+        persons: list[TrackedPerson] = []
+        if frame_w <= 0 or frame_h <= 0:
+            return persons
+
+        for track_id, data in snapshot.items():
+            x, y, w, h = cast(BBox, data["bbox"])
+            x1 = max(0.0, min(float(frame_w), float(x)))
+            y1 = max(0.0, min(float(frame_h), float(y)))
+            x2 = max(0.0, min(float(frame_w), float(x + w)))
+            y2 = max(0.0, min(float(frame_h), float(y + h)))
+            persons.append(TrackedPerson(
+                id=track_id,
+                user=str(data.get("user", "Unknown")),
+                nx=x1 / frame_w,
+                ny=y1 / frame_h,
+                nw=(x2 - x1) / frame_w,
+                nh=(y2 - y1) / frame_h,
+            ))
+        return persons
 
     def _estimate_fps(self, current_time):
         if self._last_state_time <= 0:
