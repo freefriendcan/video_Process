@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>video_Process — CV overlay (living_room_sd)</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e6e6e6;
+               font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #wrap { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+  video-stream, video-stream video { display: block; width: 100%; height: 100%; }
+  video-stream video { object-fit: contain; background: #000; }
+  #overlay { position: absolute; inset: 0; pointer-events: none; }
+  #hud { position: absolute; top: 10px; left: 10px; padding: 8px 10px;
+         background: rgba(0,0,0,0.55); border: 1px solid #2a2f37; border-radius: 6px;
+         white-space: pre; pointer-events: none; }
+  #hud .ok { color: #4ade80; } #hud .warn { color: #f59e0b; } #hud .err { color: #f87171; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video-stream id="player" mode="webrtc,mse"></video-stream>
+  <canvas id="overlay"></canvas>
+  <div id="hud">connecting…</div>
+</div>
+<script type="module">
+// ---- Config (override via query string) -------------------------------------
+// ?host=192.168.0.26  -> point both go2rtc + VisionState at that IP (Tailscale/LAN)
+// ?src=living_room_sd  ?gport=1984  ?wsport=5003
+const Q = new URLSearchParams(location.search);
+const HOST    = Q.get('host')   || location.hostname || 'localhost';
+const SRC     = Q.get('src')    || 'living_room_sd';
+const GO2RTC  = `${HOST}:${Q.get('gport')  || '1984'}`;
+const WS_VIS  = `ws://${HOST}:${Q.get('wsport') || '5003'}`;
+
+// ---- State ------------------------------------------------------------------
+let lastState = null;     // latest VisionState JSON
+let wsConnected = false;
+
+// ---- 1) Video: reuse go2rtc's own adaptive WebRTC client (video-rtc.js) ------
+// video-rtc.js is an ES MODULE that exports the VideoRTC class but does NOT
+// register a custom element itself, so we import it and define <video-stream>.
+// Loading it from the running go2rtc server keeps us version-matched and lets
+// it fall back WebRTC -> MSE automatically. Zero pipeline/go2rtc changes.
+async function startVideo() {
+  try {
+    const { VideoRTC } = await import(`http://${GO2RTC}/video-rtc.js`);
+    if (!customElements.get('video-stream')) {
+      customElements.define('video-stream', VideoRTC);
+    }
+    const player = document.getElementById('player');
+    player.mode = 'webrtc,mse';
+    player.src = `ws://${GO2RTC}/api/ws?src=${encodeURIComponent(SRC)}`;
+  } catch (e) {
+    setHud(`<span class="err">video-rtc.js load failed from ${GO2RTC}\n${e}</span>`);
+  }
+}
+
+// ---- 2) Overlay data: VisionState WebSocket (faces/persons/fall/gesture) -----
+function connectVisionWs() {
+  let ws;
+  try { ws = new WebSocket(WS_VIS); }
+  catch (e) { return scheduleReconnect(); }
+
+  ws.onopen    = () => { wsConnected = true; };
+  ws.onclose   = () => { wsConnected = false; scheduleReconnect(); };
+  ws.onerror   = () => { wsConnected = false; };
+  ws.onmessage = (ev) => { try { lastState = JSON.parse(ev.data); } catch (_) {} };
+}
+function scheduleReconnect() { setTimeout(connectVisionWs, 1000); }
+
+// ---- 3) Draw loop: map normalized boxes onto the displayed (letterboxed) video
+function videoEl() {
+  const p = document.getElementById('player');
+  return (p && (p.video || p.querySelector('video'))) || null;
+}
+
+// object-fit: contain math -> the actual video content rect inside the element.
+function contentRect(v, cw, ch) {
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw || !vh) return { ox: 0, oy: 0, dw: cw, dh: ch };
+  const s = Math.min(cw / vw, ch / vh);
+  const dw = vw * s, dh = vh * s;
+  return { ox: (cw - dw) / 2, oy: (ch - dh) / 2, dw, dh };
+}
+
+function box(ctx, r, nx, ny, nw, nh, color, label) {
+  const x = r.ox + nx * r.dw, y = r.oy + ny * r.dh, w = nw * r.dw, h = nh * r.dh;
+  ctx.lineWidth = 2; ctx.strokeStyle = color;
+  ctx.strokeRect(x, y, w, h);
+  if (label) {
+    ctx.font = '12px ui-monospace, monospace';
+    const tw = ctx.measureText(label).width + 8;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, Math.max(0, y - 16), tw, 16);
+    ctx.fillStyle = '#0b0d10';
+    ctx.fillText(label, x + 4, Math.max(11, y - 4));
+  }
+}
+
+function draw() {
+  const canvas = document.getElementById('overlay');
+  const wrap = document.getElementById('wrap');
+  const cw = wrap.clientWidth, ch = wrap.clientHeight;
+  if (canvas.width !== cw)  canvas.width = cw;
+  if (canvas.height !== ch) canvas.height = ch;
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, cw, ch);
+
+  const v = videoEl();
+  const r = v ? contentRect(v, cw, ch) : { ox: 0, oy: 0, dw: cw, dh: ch };
+  const st = lastState;
+
+  let nPersons = 0, nFaces = 0;
+  if (st) {
+    for (const p of st.persons || []) {
+      nPersons++;
+      box(ctx, r, p.nx, p.ny, p.nw, p.nh, '#38bdf8', `P${p.id} ${p.user || ''}`.trim());
+    }
+    for (const f of st.faces || []) {
+      nFaces++;
+      box(ctx, r, f.nx, f.ny, f.nw, f.nh, '#a3e635', `F${f.id} ${f.user || ''}`.trim());
+    }
+    drawFallBadge(ctx, cw, st);
+  }
+
+  setHud(hudText(st, nPersons, nFaces));
+  requestAnimationFrame(draw);
+}
+
+function drawFallBadge(ctx, cw, st) {
+  const fall = st.fall || {};
+  const status = String(fall.status || '');
+  const falling = /fall/i.test(status) || fall.verifying;
+  if (!falling) return;
+  const label = fall.verifying
+    ? `VERIFYING FALL  ${(fall.elapsed || 0).toFixed(1)}s`
+    : status.toUpperCase();
+  ctx.font = 'bold 16px ui-monospace, monospace';
+  const tw = ctx.measureText(label).width + 16;
+  ctx.fillStyle = 'rgba(248,113,113,0.92)';
+  ctx.fillRect((cw - tw) / 2, 12, tw, 26);
+  ctx.fillStyle = '#0b0d10';
+  ctx.fillText(label, (cw - tw) / 2 + 8, 30);
+}
+
+function hudText(st, nPersons, nFaces) {
+  const wsTag = wsConnected
+    ? '<span class="ok">ws ●</span>'
+    : '<span class="err">ws ○ (reconnecting)</span>';
+  if (!st) return `${wsTag}\nwaiting for VisionState…  src=${SRC}`;
+  const ir = st.ir ? '<span class="warn">IR/night</span>' : 'day';
+  const g  = st.gesture ? `  gesture=${st.gesture}` : '';
+  return [
+    `${wsTag}   fps ${(st.fps || 0).toFixed(1)}   ${ir}`,
+    `persons ${nPersons}   faces ${nFaces}${g}`,
+    `frame ${st.pw}x${st.ph}   src=${SRC}`,
+  ].join('\n');
+}
+
+function setHud(html) { document.getElementById('hud').innerHTML = html; }
+
+// ---- boot -------------------------------------------------------------------
+startVideo();
+connectVisionWs();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
