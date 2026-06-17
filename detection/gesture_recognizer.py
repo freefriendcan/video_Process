@@ -1,14 +1,23 @@
 import os
 import time
 import urllib.request
+from collections.abc import Sequence
+from typing import Protocol
 
 import mediapipe as mp
+import numpy as np
+from loguru import logger
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from loguru import logger
 
 from config import PipelineConfig
 from events.dispatcher import EventDispatcher
+
+
+class WristPose(Protocol):
+    bbox: tuple[int, int, int, int]
+    left_wrist: tuple[float, float] | None
+    right_wrist: tuple[float, float] | None
 
 
 class GestureRecognizer:
@@ -31,10 +40,11 @@ class GestureRecognizer:
         self._last_sent = ""
         self._last_sent_time = 0.0
         self.is_frontal = False
+        self._smoothed_hand_bbox: tuple[float, float, float, float] | None = None
 
         # Prevents Python GC from collecting mp.Image objects while
         # MediaPipe's C++ backend still references them.
-        self._async_image_buffer = []
+        self._async_image_buffer: list[mp.Image] = []
         self._last_timestamp_ms = 0
 
         if not os.path.exists(cfg.gesture_model):
@@ -77,7 +87,10 @@ class GestureRecognizer:
                 top_gesture = hand_gestures[0].category_name
 
                 if top_gesture in ["Thumb_Up", "Victory"] and not self.is_frontal:
-                    logger.debug("Gaze Lock: ignoring '{}' — user not looking at camera", top_gesture)
+                    logger.debug(
+                        "Gaze Lock: ignoring '{}' - user not looking at camera",
+                        top_gesture,
+                    )
                     self._current_sustained = ""
                     continue
 
@@ -93,9 +106,15 @@ class GestureRecognizer:
                         duration = 0.0
 
                     if duration > 1.0:
-                        if (top_gesture != self._last_sent or
-                                (time.time() - self._last_sent_time) > self._cfg.gesture_cooldown):
-                            logger.info("Sustained gesture: {} (duration: {:.1f}s)", top_gesture, duration)
+                        if (
+                            top_gesture != self._last_sent
+                            or (time.time() - self._last_sent_time) > self._cfg.gesture_cooldown
+                        ):
+                            logger.info(
+                                "Sustained gesture: {} (duration: {:.1f}s)",
+                                top_gesture,
+                                duration,
+                            )
                             detected_user = self._get_active_user()
                             self._dispatcher.submit(
                                 self._dispatcher.send_gesture_event,
@@ -108,14 +127,20 @@ class GestureRecognizer:
 
         self._is_processing = False
 
-    def process(self, rgb_frame, current_time):
+    def process(
+        self,
+        rgb_frame: np.ndarray,
+        current_time: float,
+        poses: Sequence[WristPose] | None = None,
+    ) -> None:
         current_ms = int(current_time * 1000)
         if current_ms <= self._last_timestamp_ms:
             current_ms = self._last_timestamp_ms + 1
         self._last_timestamp_ms = current_ms
 
         try:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame.copy())
+            roi = self._hand_roi(rgb_frame, poses)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi.copy())
             self._async_image_buffer.append(mp_image)
             if len(self._async_image_buffer) > 30:
                 self._async_image_buffer.pop(0)
@@ -125,3 +150,75 @@ class GestureRecognizer:
                 self._recognizer.recognize_async(mp_image, current_ms)
         except Exception:
             self._is_processing = False
+
+    def _hand_roi(self, rgb_frame: np.ndarray, poses: Sequence[WristPose] | None) -> np.ndarray:
+        bbox = self._raw_hand_bbox(rgb_frame, poses)
+        if bbox is None:
+            self._smoothed_hand_bbox = None
+            return rgb_frame
+
+        if self._smoothed_hand_bbox is None:
+            smoothed = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        else:
+            alpha = self._cfg.hand_crop_ema_alpha
+            smoothed_values = tuple(
+                alpha * float(new_value) + (1.0 - alpha) * old_value
+                for new_value, old_value in zip(bbox, self._smoothed_hand_bbox)
+            )
+            smoothed = (
+                smoothed_values[0],
+                smoothed_values[1],
+                smoothed_values[2],
+                smoothed_values[3],
+            )
+        self._smoothed_hand_bbox = smoothed
+
+        x, y, w, h = [int(round(value)) for value in smoothed]
+        frame_h, frame_w = rgb_frame.shape[:2]
+        x1 = max(0, min(frame_w, x))
+        y1 = max(0, min(frame_h, y))
+        x2 = max(0, min(frame_w, x + max(1, w)))
+        y2 = max(0, min(frame_h, y + max(1, h)))
+        if x2 <= x1 or y2 <= y1:
+            return rgb_frame
+        return rgb_frame[y1:y2, x1:x2]
+
+    def _raw_hand_bbox(
+        self,
+        rgb_frame: np.ndarray,
+        poses: Sequence[WristPose] | None,
+    ) -> tuple[int, int, int, int] | None:
+        if not poses:
+            return None
+
+        frame_h, frame_w = rgb_frame.shape[:2]
+        for pose in poses:
+            wrist_points = [
+                point
+                for point in (pose.left_wrist, pose.right_wrist)
+                if point is not None
+            ]
+            if not wrist_points:
+                continue
+
+            person_x, person_y, person_w, person_h = pose.bbox
+            pad = int(round(max(person_w, person_h) * self._cfg.hand_crop_pad / 2.0))
+            xs = [point[0] for point in wrist_points]
+            ys = [point[1] for point in wrist_points]
+            x1 = max(0, int(round(min(xs) - pad)))
+            y1 = max(0, int(round(min(ys) - pad)))
+            x2 = min(frame_w, int(round(max(xs) + pad)))
+            y2 = min(frame_h, int(round(max(ys) + pad)))
+            if x2 > x1 and y2 > y1:
+                return x1, y1, x2 - x1, y2 - y1
+
+            fallback_w = max(1, int(round(person_w * self._cfg.hand_crop_pad)))
+            fallback_h = max(1, int(round(person_h * self._cfg.hand_crop_pad)))
+            return (
+                max(0, min(frame_w, person_x)),
+                max(0, min(frame_h, person_y)),
+                min(frame_w - person_x, fallback_w),
+                min(frame_h - person_y, fallback_h),
+            )
+
+        return None
