@@ -71,12 +71,45 @@ class PipelineConfig:
     blaze_face_model: str = "blaze_face_short_range.tflite"
     gesture_model: str = "gesture_recognizer.task"
     fall_model: str = "data/models/fall_detection_transformer.tflite"
+    person_model: str = "data/models/yolo11m-person.onnx"
+    face_det_model: str = "data/models/yolov11n-face.onnx"
+    onnx_providers: tuple[str, ...] = ("CoreMLExecutionProvider", "CPUExecutionProvider")
 
     # Face detection
     min_detection_confidence: float = 0.5
+    person_conf_threshold: float = 0.5
+    face_conf_threshold: float = 0.5
+    det_nms_iou: float = 0.45
+
+    # Local ArcFace identification
+    arcface_model_name: str = "buffalo_l"
+    gallery_path: str = "data/embeddings/faces.pkl"
+    face_match_cosine_threshold: float = 0.35
+
+    # Person crop padding for pose
+    person_crop_pad: float = 0.15
+
+    # Person detection cadence (s). YOLO11l person is ~34 ms; run it on an
+    # interval and let the BoxMOT person tracker carry the intermediate frames.
+    person_detection_interval: float = 0.15
+
+    # Person MOT
+    tracker_type: str = "botsort"
+    reid_device: str = "mps"
+    reid_half: bool = False
+    tracker_low_conf: float = 0.1
+    tracker_new_track_thresh: float = 0.6
+    tracker_match_thresh: float = 0.8
+    tracker_proximity_thresh: float = 0.5
+    tracker_appearance_thresh: float = 0.25
+    tracker_cmc_method: str = "ecc"
+    tracker_track_buffer: int = 30
+    tracker_frame_rate: int = 30
 
     # Gesture
     gesture_cooldown: float = 1.0
+    hand_crop_pad: float = 0.6
+    hand_crop_ema_alpha: float = 0.5
 
     # Fall detection
     fall_input_timesteps: int = 30

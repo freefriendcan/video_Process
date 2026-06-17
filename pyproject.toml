@@ -29,32 +29,29 @@ dependencies = [
     # Core CV
     "opencv-python>=4.8.0",
     "mediapipe==0.10.14",
-    "numpy>=1.24.0",
-
+    "numpy>=1.24.0,<2.0.0",
     # TFLite Runtime (fall detection transformer)
     "ai-edge-litert>=2.1.0",
-
     # Streaming
     "websockets>=12.0",
-
     # HTTP client (agent communication)
     "requests>=2.31.0",
-
     # Config
     "python-dotenv>=1.0.0",
-
     # Future use (ByteTrack, on-device face recognition)
     "ultralytics>=8.0.0",
     "torch>=2.0.0",
     "deepface>=0.0.80",
     "onnxruntime>=1.16.0,<1.24.0",
+    "onnx>=1.16.0,<1.18.0",
+    "insightface>=0.7.3",
     "face-alignment>=1.4.0",
     "scikit-image>=0.21.0",
-
     # Utilities
     "pillow>=10.0.0",
     "loguru>=0.7.0",
     "pyyaml>=6.0",
+    "boxmot==19.0.0",
 ]
 
 [project.optional-dependencies]
