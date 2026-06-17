@@ -65,13 +65,18 @@ data/models/*
 
 # Runtime data
 data/embeddings/*
+data/enroll/*
 data/logs/*
 data/recordings/*
 data/test_videos/*
 !data/embeddings/.gitkeep
+!data/enroll/.gitkeep
 !data/logs/.gitkeep
 !data/recordings/.gitkeep
 !data/test_videos/.gitkeep
+
+# Planning / handoff scratch docs (not part of the tracked repo)
+*_PLAN.md
 
 # OS
 .DS_Store
