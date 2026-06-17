@@ -92,7 +92,7 @@ def _single_quality_face(
         return None, f"expected exactly one face, got {len(faces)}"
 
     face = faces[0]
-    x, y, w, h, keypoints = face
+    x, y, w, h, _score, keypoints = face
     face_roi = bgr_frame[max(0, y) : y + h, max(0, x) : x + w]
     if face_roi.size == 0:
         return None, "empty face crop"
@@ -171,7 +171,7 @@ def main() -> int:
                 try:
                     preview_frame = frame.copy()
                     if face is not None:
-                        x, y, w, h, _keypoints = face
+                        x, y, w, h, _score, _keypoints = face
                         cv2.rectangle(preview_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     cv2.imshow("Enrollment Capture", preview_frame)
                     key = cv2.waitKey(1) & 0xFF

@@ -148,7 +148,7 @@ def main() -> int:
                 logger.warning("[{}] no face detected: {}", expected_label, image_path.name)
                 continue
 
-            x, y, w, h, keypoints = face
+            x, y, w, h, _score, keypoints = face
             face_roi = bgr[max(0, y) : y + h, max(0, x) : x + w]
             if face_roi.size == 0:
                 logger.warning("[{}] empty crop: {}", expected_label, image_path.name)

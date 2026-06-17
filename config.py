@@ -81,6 +81,15 @@ class PipelineConfig:
     face_conf_threshold: float = 0.5
     det_nms_iou: float = 0.45
 
+    # Face MOT
+    face_detection_interval: float = 0.15
+    face_tracker_type: str = "bytetrack"
+    face_track_thresh: float = 0.5
+    face_track_low_conf: float = 0.1
+    face_match_thresh: float = 0.8
+    face_track_buffer: int = 30
+    face_tracker_frame_rate: int = 30
+
     # Local ArcFace identification
     arcface_model_name: str = "buffalo_l"
     gallery_path: str = "data/embeddings/faces.pkl"

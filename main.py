@@ -10,7 +10,7 @@ from loguru import logger
 
 from capture.frame_producer import FrameProducer
 from config import PipelineConfig
-from detection.face_detector import FaceDetector
+from detection.face_detector import FaceDetection, FaceDetector
 from detection.fall_detector import FallDetector
 from detection.gesture_recognizer import GestureRecognizer
 from detection.onnx_runtime import BBox, NormalizedKeypoint
@@ -133,7 +133,17 @@ class VisionPipeline:
             current_time = time.time()
             self._frame_counter += 1
 
-            active = tracker_mgr.update_all(frame, current_time)
+            rgb_frame = pkt.rgb
+
+            face_detections: list[FaceDetection] = []
+            if current_time - last_detection_time > self._cfg.face_detection_interval:
+                face_detections = face_det.detect(rgb_frame)
+                last_detection_time = current_time
+            new_faces, active = tracker_mgr.update_face_tracks(
+                face_detections,
+                frame,
+                current_time,
+            )
 
             for t in active:
                 t_id = t["id"]
@@ -152,7 +162,12 @@ class VisionPipeline:
                         dispatcher.submit(dispatcher.send_presence, user)
                         tracker_mgr.update_field(t_id, last_json_time=current_time)
 
-            rgb_frame = pkt.rgb
+            self._identify_new_faces(
+                new_faces=new_faces,
+                frame=frame,
+                frame_size=(frame_w, frame_h),
+                ir_mode=pkt.ir_mode,
+            )
 
             person_dets: list[PersonDetection] = []
             if current_time - last_person_detection_time > self._cfg.person_detection_interval:
@@ -182,18 +197,6 @@ class VisionPipeline:
 
             gesture_rec.process(rgb_frame, current_time, pose_tracks)
             gesture_rec.clear_stale(current_time)
-
-            if current_time - last_detection_time > 0.15:
-                faces = face_det.detect(rgb_frame)
-                new_faces = tracker_mgr.match_and_update(faces, frame, current_time)
-                self._identify_new_faces(
-                    new_faces=new_faces,
-                    frame=frame,
-                    frame_size=(frame_w, frame_h),
-                    ir_mode=pkt.ir_mode,
-                )
-
-                last_detection_time = current_time
 
             tracker_mgr.propagate_identity()
             faces = self._build_faces(tracker_mgr.snapshot, frame_w, frame_h)

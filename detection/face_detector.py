@@ -6,7 +6,7 @@ from loguru import logger
 from config import PipelineConfig
 from detection.onnx_runtime import BBox, NormalizedKeypoint, OnnxModel, YoloDetection
 
-FaceDetection = tuple[int, int, int, int, tuple[NormalizedKeypoint, ...]]
+FaceDetection = tuple[int, int, int, int, float, tuple[NormalizedKeypoint, ...]]
 
 
 class FaceDetector:
@@ -20,7 +20,7 @@ class FaceDetector:
         logger.info("FaceDetector initialized with providers: {}", self._model.providers)
 
     def detect(self, rgb_frame: np.ndarray) -> list[FaceDetection]:
-        """Detect faces, returning the legacy tracker contract with keypoints."""
+        """Detect faces, returning bbox, confidence, and keypoints."""
         output, meta = self._model.infer_rgb(rgb_frame)
         detections = self._model.postprocess_yolo(
             output=output,
@@ -38,7 +38,7 @@ class FaceDetector:
 
             x, y, w, h = self._pad_bbox(detection.bbox, frame_w, frame_h)
             keypoints = self._quality_gate_keypoints(detection, frame_w, frame_h)
-            faces.append((x, y, w, h, keypoints))
+            faces.append((x, y, w, h, detection.score, keypoints))
 
         return faces
 

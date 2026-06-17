@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from config import PipelineConfig
+from detection.face_detector import FaceDetector
 from detection.fall_detector import FallDetector, FallTrackState
 from detection.onnx_runtime import LetterboxMeta, NormalizedKeypoint, OnnxModel, YoloDetection
 from detection.person_detector import PersonDetector
@@ -92,6 +93,177 @@ def test_person_detector_returns_bbox_with_confidence():
     detections = detector.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
 
     assert detections == [((10, 20, 30, 40), 0.87)]
+
+
+def test_face_detector_returns_bbox_confidence_and_keypoints():
+    keypoints = (
+        (20.0, 30.0, 1.0),
+        (40.0, 30.0, 1.0),
+        (30.0, 45.0, 1.0),
+        (22.0, 58.0, 1.0),
+        (38.0, 58.0, 1.0),
+    )
+
+    class FakeModel:
+        def infer_rgb(self, _rgb_frame: np.ndarray):
+            return np.empty((0,), dtype=np.float32), object()
+
+        def postprocess_yolo(self, **_kwargs: object) -> list[YoloDetection]:
+            return [
+                YoloDetection(
+                    bbox=(10, 20, 40, 60),
+                    score=0.91,
+                    class_id=0,
+                    keypoints=keypoints,
+                )
+            ]
+
+    detector = FaceDetector.__new__(FaceDetector)
+    detector._cfg = PipelineConfig()
+    detector._model = FakeModel()
+
+    detections = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    assert len(detections) == 1
+    x, y, w, h, score, detection_keypoints = detections[0]
+    assert (x, y, w, h) == (0, 0, 60, 100)
+    assert score == 0.91
+    assert detection_keypoints[0] == NormalizedKeypoint(x=0.2, y=0.3)
+
+
+class FakeMotTracker:
+    def __init__(self, outputs: list[np.ndarray]) -> None:
+        self.outputs = outputs
+        self.calls: list[np.ndarray] = []
+
+    def update(
+        self,
+        dets: np.ndarray,
+        img: np.ndarray,
+        embs: np.ndarray | None = None,
+    ) -> np.ndarray:
+        self.calls.append(dets.copy())
+        if self.outputs:
+            return self.outputs.pop(0)
+        return np.empty((0, 8), dtype=np.float32)
+
+
+def _face_manager(fake_mot: FakeMotTracker) -> TrackerManager:
+    manager = TrackerManager.__new__(TrackerManager)
+    manager._cfg = PipelineConfig()
+    manager._lock = threading.Lock()
+    manager._trackers = {}
+    manager._face_mot = fake_mot
+    return manager
+
+
+def test_face_bytetrack_new_track_shape_and_keypoint_attachment():
+    keypoints = (
+        NormalizedKeypoint(x=0.2, y=0.3),
+        NormalizedKeypoint(x=0.4, y=0.3),
+    )
+    fake_mot = FakeMotTracker(
+        [
+            np.asarray([[10, 20, 40, 60, 7, 0.88, 0, 0]], dtype=np.float32),
+        ]
+    )
+    manager = _face_manager(fake_mot)
+
+    new_faces, active = manager.update_face_tracks(
+        [(10, 20, 30, 40, 0.88, keypoints)],
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        current_time=10.0,
+    )
+
+    np.testing.assert_allclose(
+        fake_mot.calls[0],
+        np.asarray([[10.0, 20.0, 40.0, 60.0, 0.88, 0.0]], dtype=np.float32),
+    )
+    assert new_faces == [{"tracker_id": 7, "bbox": (10, 20, 30, 40), "keypoints": keypoints}]
+    assert active[0]["id"] == 7
+    assert active[0]["user"] == "Identifying..."
+    assert active[0]["detection_keypoints"] == keypoints
+
+
+def test_face_bytetrack_preserves_identity_across_updates():
+    keypoints = (NormalizedKeypoint(x=0.2, y=0.3),)
+    fake_mot = FakeMotTracker(
+        [
+            np.asarray([[10, 20, 40, 60, 7, 0.88, 0, 0]], dtype=np.float32),
+            np.asarray([[12, 22, 42, 62, 7, 0.86, 0, 0]], dtype=np.float32),
+        ]
+    )
+    manager = _face_manager(fake_mot)
+
+    manager.update_face_tracks(
+        [(10, 20, 30, 40, 0.88, keypoints)],
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        current_time=10.0,
+    )
+    manager.set_user(7, "Ada", retry_count=0)
+    new_faces, active = manager.update_face_tracks(
+        [(12, 22, 30, 40, 0.86, keypoints)],
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        current_time=10.1,
+    )
+
+    assert new_faces == []
+    assert active[0]["id"] == 7
+    assert active[0]["user"] == "Ada"
+    assert active[0]["bbox"] == (12, 22, 30, 40)
+
+
+def test_face_bytetrack_keypoints_fall_back_to_iou_when_det_index_absent():
+    first_keypoints = (NormalizedKeypoint(x=0.1, y=0.1),)
+    second_keypoints = (NormalizedKeypoint(x=0.8, y=0.8),)
+    fake_mot = FakeMotTracker(
+        [
+            np.asarray([[100, 100, 150, 150, 9, 0.8, 0, -1]], dtype=np.float32),
+        ]
+    )
+    manager = _face_manager(fake_mot)
+
+    new_faces, active = manager.update_face_tracks(
+        [
+            (10, 10, 30, 30, 0.7, first_keypoints),
+            (98, 99, 55, 52, 0.8, second_keypoints),
+        ],
+        np.zeros((200, 200, 3), dtype=np.uint8),
+        current_time=11.0,
+    )
+
+    assert new_faces[0]["keypoints"] == second_keypoints
+    assert active[0]["detection_keypoints"] == second_keypoints
+
+
+def test_face_bytetrack_evicts_stale_tracks():
+    fake_mot = FakeMotTracker([np.empty((0, 8), dtype=np.float32)])
+    manager = _face_manager(fake_mot)
+    manager._cfg.face_track_buffer = 1
+    manager._cfg.face_tracker_frame_rate = 1
+    manager._cfg.face_detection_interval = 0.1
+    manager._trackers = {
+        4: {
+            "user": "Ada",
+            "bbox": (1, 2, 3, 4),
+            "retry_count": 0,
+            "last_identify_time": 1.0,
+            "last_json_time": 1.0,
+            "best_quality_score": 0,
+            "detection_keypoints": None,
+            "last_seen": 0.0,
+            "is_new": False,
+        }
+    }
+
+    _new_faces, active = manager.update_face_tracks(
+        [],
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        current_time=2.1,
+    )
+
+    assert active == []
+    assert manager.exists(4) is False
 
 
 def test_fall_alert_payload_has_action_schema_without_top_level_confidence():

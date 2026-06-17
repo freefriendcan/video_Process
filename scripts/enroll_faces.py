@@ -46,7 +46,7 @@ def _largest_face(faces: list[FaceDetection]) -> FaceDetection | None:
     """Pick the detection with the largest bbox area, or None if empty."""
     if not faces:
         return None
-    return max(faces, key=lambda f: f[2] * f[3])  # f = (x, y, w, h, keypoints)
+    return max(faces, key=lambda f: f[2] * f[3])  # f = (x, y, w, h, score, keypoints)
 
 
 def enroll_person(
@@ -74,7 +74,7 @@ def enroll_person(
             logger.warning("[{}] no face detected: {}", person_dir.name, img_path.name)
             continue
 
-        x, y, w, h, keypoints = face
+        x, y, w, h, _score, keypoints = face
         face_roi = bgr[max(0, y) : y + h, max(0, x) : x + w]  # BGR crop — matches live path
         if face_roi.size == 0:
             logger.warning("[{}] empty crop: {}", person_dir.name, img_path.name)

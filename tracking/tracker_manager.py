@@ -5,11 +5,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-import cv2
 import numpy as np
 from loguru import logger
 
 from config import PipelineConfig
+from detection.face_detector import FaceDetection
+from detection.onnx_runtime import NormalizedKeypoint
 
 BBox = tuple[int, int, int, int]
 PersonDetection = tuple[BBox, float]
@@ -23,14 +24,6 @@ class PersonTrackRecord:
     reid_ok: bool
     last_seen: float
     confidence: float
-
-
-class _CvTracker(Protocol):
-    def init(self, image: np.ndarray, bounding_box: BBox) -> bool:
-        ...
-
-    def update(self, image: np.ndarray) -> tuple[bool, tuple[float, float, float, float]]:
-        ...
 
 
 class _MotTracker(Protocol):
@@ -47,11 +40,31 @@ class TrackerManager:
     def __init__(self, cfg: PipelineConfig):
         self._cfg = cfg
         self._trackers: dict[int, dict[str, Any]] = {}
+        self._face_mot = self._build_face_tracker(cfg)
         self._person_tracks: dict[int, PersonTrackRecord] = {}
         self._person_reid_enabled = cfg.tracker_type.lower() == "botsort"
         self._person_mot = self._build_person_tracker(cfg)
         self._lock = threading.Lock()
-        self._next_id = 0
+
+    @staticmethod
+    def _build_face_tracker(cfg: PipelineConfig) -> _MotTracker:
+        tracker_type = cfg.face_tracker_type.strip().lower()
+        if tracker_type != "bytetrack":
+            raise ValueError("face_tracker_type must be 'bytetrack'")
+
+        from boxmot.trackers import ByteTrack
+
+        tracker = ByteTrack(
+            min_conf=cfg.face_track_low_conf,
+            track_thresh=cfg.face_track_thresh,
+            match_thresh=cfg.face_match_thresh,
+            track_buffer=cfg.face_track_buffer,
+            frame_rate=cfg.face_tracker_frame_rate,
+            per_class=False,
+            min_hits=1,
+        )
+        logger.info("Face tracker initialized: ByteTrack")
+        return cast(_MotTracker, tracker)
 
     @staticmethod
     def _build_person_tracker(cfg: PipelineConfig) -> _MotTracker:
@@ -116,114 +129,124 @@ class TrackerManager:
             return 0.0
         return inter_area / float(box_a_area + box_b_area - inter_area)
 
-    def update_all(self, frame, current_time):
-        """Update all KCF trackers. Evicts TTL-expired and lost trackers.
+    def update_face_tracks(
+        self,
+        faces: Sequence[FaceDetection],
+        frame: np.ndarray,
+        current_time: float,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Update ByteTrack-backed face tracks and return ``(new_faces, active)``."""
+        det_array = self._face_detections_to_boxmot(faces)
+        results = np.asarray(self._face_mot.update(det_array, frame), dtype=np.float32)
+        self._apply_face_results(results, faces, current_time)
+        self._evict_stale_face_tracks(current_time)
+        return self._new_face_tracks(results), self.active_face_tracks
 
-        Returns list of dicts for active trackers with keys:
-            id, bbox, user, detection_keypoints, last_json_time,
-            retry_count, last_identify_time, best_quality_score
-        """
-        with self._lock:
-            snapshot = list(self._trackers.items())
+    @staticmethod
+    def _face_detections_to_boxmot(faces: Sequence[FaceDetection]) -> np.ndarray:
+        if not faces:
+            return np.empty((0, 6), dtype=np.float32)
 
-        to_delete = []
-        active = []
+        rows: list[tuple[float, float, float, float, float, float]] = []
+        for x, y, w, h, score, _keypoints in faces:
+            rows.append(
+                (
+                    float(x),
+                    float(y),
+                    float(x + w),
+                    float(y + h),
+                    float(score),
+                    0.0,
+                )
+            )
+        return np.asarray(rows, dtype=np.float32)
 
-        for t_id, t_data in snapshot:
-            success, bbox = t_data["tracker"].update(frame)
+    def _apply_face_results(
+        self,
+        results: np.ndarray,
+        faces: Sequence[FaceDetection],
+        current_time: float,
+    ) -> None:
+        if results.size == 0:
+            return
+        if results.ndim == 1:
+            results = results.reshape(1, -1)
 
-            if success:
-                x, y, w, h = [int(v) for v in bbox]
-                with self._lock:
-                    if t_id not in self._trackers:
-                        continue
+        for row in results:
+            if row.shape[0] < 8:
+                logger.warning("Unexpected BoxMOT face track row shape: {}", row.shape)
+                continue
 
-                    if current_time - t_data.get("last_blazeface_update", current_time) > 1.0:
-                        logger.debug("[{}] Tracker TTL expired (ghost box) — force deleting", t_id)
-                        to_delete.append(t_id)
-                        continue
-
-                    t_data["bbox"] = (x, y, w, h)
-                    info = {
-                        "id": t_id,
-                        "bbox": (x, y, w, h),
-                        "user": t_data["user"],
-                        "detection_keypoints": t_data.get("detection_keypoints"),
-                        "last_json_time": t_data.get("last_json_time", 0),
-                        "retry_count": t_data["retry_count"],
-                        "last_identify_time": t_data["last_identify_time"],
-                        "best_quality_score": t_data.get("best_quality_score", 0),
-                    }
-
-                active.append(info)
-            else:
-                to_delete.append(t_id)
-
-        with self._lock:
-            for t_id in to_delete:
-                if t_id in self._trackers:
-                    logger.debug("Box lost [{}] — removing from tracker dict", t_id)
-                    del self._trackers[t_id]
-
-        return active
-
-    def match_and_update(self, faces, frame, current_time):
-        """Match face detections to existing trackers via IoU.
-        Reinits drifted KCF trackers for matches, creates new trackers for unmatched faces.
-
-        Returns list of dicts for NEW faces: tracker_id, bbox, keypoints
-        """
-        new_faces = []
-
-        for face_data in faces:
-            x, y, w, h, keypoints = face_data
-            matched_id = None
+            track_id = int(row[4])
+            bbox = self._xyxy_to_bbox(row[:4])
+            keypoints = self._keypoints_for_face_track(row, bbox, faces)
 
             with self._lock:
-                best_iou = 0.0
-                for t_id, t_data in self._trackers.items():
-                    iou = self.calculate_iou((x, y, w, h), t_data["bbox"])
-                    if iou > best_iou:
-                        best_iou = iou
-                        if iou > 0.3:
-                            matched_id = t_id
+                existing = self._trackers.get(track_id, {})
+                is_new = track_id not in self._trackers
+                self._trackers[track_id] = {
+                    "user": existing.get("user", "Identifying..."),
+                    "bbox": bbox,
+                    "retry_count": existing.get("retry_count", 0),
+                    "last_identify_time": existing.get("last_identify_time", current_time),
+                    "last_json_time": existing.get("last_json_time", 0),
+                    "best_quality_score": existing.get("best_quality_score", 0),
+                    "detection_keypoints": keypoints
+                    if keypoints is not None
+                    else existing.get("detection_keypoints"),
+                    "last_seen": current_time,
+                    "is_new": is_new,
+                }
 
-            if matched_id is not None:
-                new_tracker = self._new_kcf_tracker()
-                new_tracker.init(frame, (x, y, w, h))
-                with self._lock:
-                    if matched_id in self._trackers:
-                        self._trackers[matched_id]["tracker"] = new_tracker
-                        self._trackers[matched_id]["bbox"] = (x, y, w, h)
-                        self._trackers[matched_id]["detection_keypoints"] = keypoints
-                        self._trackers[matched_id]["last_blazeface_update"] = current_time
-            else:
-                logger.info("New face detected — tracking initiated (ID: {})", self._next_id)
-                tracker = self._new_kcf_tracker()
-                tracker.init(frame, (x, y, w, h))
+            if is_new:
+                logger.info("New face detected — ByteTrack ID: {}", track_id)
 
-                tracker_id = self._next_id
-                self._next_id += 1
+    def _keypoints_for_face_track(
+        self,
+        row: np.ndarray,
+        bbox: BBox,
+        faces: Sequence[FaceDetection],
+    ) -> tuple[NormalizedKeypoint, ...] | None:
+        if not faces:
+            return None
 
-                with self._lock:
-                    self._trackers[tracker_id] = {
-                        "tracker": tracker,
-                        "user": "Identifying...",
-                        "bbox": (x, y, w, h),
-                        "retry_count": 0,
-                        "last_identify_time": current_time,
-                        "last_json_time": 0,
-                        "best_quality_score": 0,
-                        "detection_keypoints": keypoints,
-                        "last_blazeface_update": current_time,
+        det_index = int(row[7]) if row.shape[0] > 7 else -1
+        if 0 <= det_index < len(faces):
+            return faces[det_index][5]
+
+        best_iou = 0.0
+        best_keypoints: tuple[NormalizedKeypoint, ...] | None = None
+        for face in faces:
+            face_bbox = (face[0], face[1], face[2], face[3])
+            iou = self.calculate_iou(bbox, face_bbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_keypoints = face[5]
+        return best_keypoints
+
+    def _new_face_tracks(self, results: np.ndarray) -> list[dict[str, object]]:
+        if results.size == 0:
+            return []
+        if results.ndim == 1:
+            results = results.reshape(1, -1)
+
+        new_faces: list[dict[str, object]] = []
+        with self._lock:
+            for row in results:
+                if row.shape[0] < 8:
+                    continue
+                track_id = int(row[4])
+                data = self._trackers.get(track_id)
+                if data is None or not bool(data.get("is_new", False)):
+                    continue
+                new_faces.append(
+                    {
+                        "tracker_id": track_id,
+                        "bbox": data["bbox"],
+                        "keypoints": data.get("detection_keypoints"),
                     }
-
-                new_faces.append({
-                    "tracker_id": tracker_id,
-                    "bbox": (x, y, w, h),
-                    "keypoints": keypoints,
-                })
-
+                )
+                data["is_new"] = False
         return new_faces
 
     def update_person_tracks(
@@ -315,10 +338,20 @@ class TrackerManager:
                 logger.debug("[person:{}] MOT track expired — removing identity state", track_id)
                 del self._person_tracks[track_id]
 
-    @staticmethod
-    def _new_kcf_tracker() -> _CvTracker:
-        factory = getattr(cv2, "TrackerKCF_create")
-        return cast(_CvTracker, factory())
+    def _evict_stale_face_tracks(self, current_time: float) -> None:
+        ttl = max(
+            self._cfg.face_detection_interval * 2.0,
+            self._cfg.face_track_buffer / max(1.0, float(self._cfg.face_tracker_frame_rate)),
+        )
+        with self._lock:
+            stale_track_ids = [
+                track_id
+                for track_id, data in self._trackers.items()
+                if current_time - float(data.get("last_seen", current_time)) > ttl
+            ]
+            for track_id in stale_track_ids:
+                logger.debug("[face:{}] MOT track expired — removing identity state", track_id)
+                del self._trackers[track_id]
 
     def set_user(self, tracker_id, user, retry_count=None, increment_retry=False):
         """Thread-safe user update. Returns current retry_count, or None if tracker gone."""
@@ -409,6 +442,23 @@ class TrackerManager:
             return tracker_id in self._trackers
 
     @property
+    def active_face_tracks(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [
+                {
+                    "id": track_id,
+                    "bbox": data["bbox"],
+                    "user": data["user"],
+                    "detection_keypoints": data.get("detection_keypoints"),
+                    "last_json_time": data.get("last_json_time", 0),
+                    "retry_count": data.get("retry_count", 0),
+                    "last_identify_time": data.get("last_identify_time", 0),
+                    "best_quality_score": data.get("best_quality_score", 0),
+                }
+                for track_id, data in sorted(self._trackers.items())
+            ]
+
+    @property
     def active_person_tracks(self) -> list[dict[str, object]]:
         with self._lock:
             return [
@@ -440,9 +490,6 @@ class TrackerManager:
 
     @property
     def snapshot(self):
-        """Thread-safe copy of all tracker data (excluding cv2 tracker objects)."""
+        """Thread-safe copy of face-track metadata."""
         with self._lock:
-            return {
-                t_id: {k: v for k, v in t_data.items() if k != "tracker"}
-                for t_id, t_data in self._trackers.items()
-            }
+            return {t_id: dict(t_data) for t_id, t_data in self._trackers.items()}
