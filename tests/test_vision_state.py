@@ -1,4 +1,4 @@
-from streaming.vision_state import TrackedFace, TrackedPerson, VisionState
+from streaming.vision_state import FallRegion, TrackedFace, TrackedPerson, VisionState
 
 
 def test_vision_state_serializes_frontend_contract():
@@ -35,6 +35,15 @@ def test_vision_state_serializes_frontend_contract():
             "verifying": False,
             "elapsed": 0.0,
         },
+        fall_region=FallRegion(nx=0.125, ny=0.0, nw=0.75, nh=1.0),
+        poses=(
+            {
+                "id": 3,
+                "points": {
+                    "Left Wrist": [0.5, 0.5, 0.9],
+                },
+            },
+        ),
         ir=True,
     )
 
@@ -50,6 +59,8 @@ def test_vision_state_serializes_frontend_contract():
         "persons",
         "gesture",
         "fall",
+        "fall_region",
+        "poses",
         "ir",
     ]
     assert payload["faces"] == [
@@ -78,4 +89,25 @@ def test_vision_state_serializes_frontend_contract():
         "verifying": False,
         "elapsed": 0.0,
     }
+    assert payload["fall_region"] == {
+        "nx": 0.125,
+        "ny": 0.0,
+        "nw": 0.75,
+        "nh": 1.0,
+    }
+    assert payload["poses"] == [
+        {
+            "id": 3,
+            "points": {
+                "Left Wrist": [0.5, 0.5, 0.9],
+            },
+        }
+    ]
     assert payload["ir"] is True
+
+
+def test_vision_state_defaults_fall_region_absent_and_poses_empty():
+    payload = VisionState(ts=1.0, fid=1, fps=0.0, pw=1280, ph=720).to_dict()
+
+    assert payload["fall_region"] is None
+    assert payload["poses"] == []

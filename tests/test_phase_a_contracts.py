@@ -414,6 +414,9 @@ def test_fall_detector_feeds_pose_contiguous_four_three_crop():
     assert result.pose.crop_bbox == (160, 0, 960, 720)
     assert result.pose.left_wrist == pytest.approx((640.0, 360.0))
     assert result.pose.right_wrist == pytest.approx((640.0, 360.0))
+    assert result.pose.points is not None
+    assert result.pose.points["Left Wrist"] == pytest.approx((0.5, 0.5, 1.0))
+    assert result.pose.points["Nose"] == pytest.approx((0.3125, 0.2, 1.0))
 
     state = detector._track_states[3]
     model_features = state.feature_buffer[-1]

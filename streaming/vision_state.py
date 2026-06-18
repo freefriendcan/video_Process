@@ -46,6 +46,22 @@ class TrackedPerson:
 
 
 @dataclass(frozen=True)
+class FallRegion:
+    nx: float
+    ny: float
+    nw: float
+    nh: float
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "nx": self.nx,
+            "ny": self.ny,
+            "nw": self.nw,
+            "nh": self.nh,
+        }
+
+
+@dataclass(frozen=True)
 class VisionState:
     ts: float
     fid: int
@@ -56,6 +72,8 @@ class VisionState:
     persons: Sequence[TrackedPerson] = field(default_factory=tuple)
     gesture: str = ""
     fall: Mapping[str, Any] = field(default_factory=dict)
+    fall_region: FallRegion | None = None
+    poses: Sequence[Mapping[str, object]] = field(default_factory=tuple)
     ir: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,5 +87,7 @@ class VisionState:
             "persons": [person.to_dict() for person in self.persons],
             "gesture": self.gesture,
             "fall": dict(self.fall),
+            "fall_region": self.fall_region.to_dict() if self.fall_region else None,
+            "poses": [dict(pose) for pose in self.poses],
             "ir": self.ir,
         }

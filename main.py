@@ -11,14 +11,15 @@ from loguru import logger
 from capture.frame_producer import FrameProducer
 from config import PipelineConfig
 from detection.face_detector import FaceDetection, FaceDetector
-from detection.fall_detector import FallDetector
+from detection.fall_detector import FallDetector, PoseTrackData
+from detection.fall_geometry import fall_region_px
 from detection.gesture_recognizer import GestureRecognizer
 from detection.onnx_runtime import BBox, NormalizedKeypoint
 from detection.person_detector import PersonDetection, PersonDetector
 from events.dispatcher import EventDispatcher
 from identification.face_identifier import FaceIdentifier
 from quality.face_quality_gate import FaceQualityGate
-from streaming.vision_state import TrackedFace, TrackedPerson, VisionState
+from streaming.vision_state import FallRegion, TrackedFace, TrackedPerson, VisionState
 from streaming.vision_ws_server import VisionWSServer
 from tracking.tracker_manager import TrackerManager
 
@@ -178,7 +179,7 @@ class VisionPipeline:
             active_person_ids = {int(person_track["id"]) for person_track in person_tracks}
             fall_det.sync_tracks(active_person_ids)
 
-            pose_tracks = []
+            pose_tracks: list[PoseTrackData] = []
             for person_track in person_tracks:
                 person_track_id = int(person_track["id"])
                 person_bbox = cast(BBox, person_track["bbox"])
@@ -201,6 +202,8 @@ class VisionPipeline:
             tracker_mgr.propagate_identity()
             faces = self._build_faces(tracker_mgr.snapshot, frame_w, frame_h)
             persons = self._build_persons(tracker_mgr.person_snapshot, frame_w, frame_h)
+            fall_region = self._build_fall_region(frame_w, frame_h)
+            poses = self._build_poses(pose_tracks)
             fall_state = {
                 "status": fall_det.status,
                 "confidence": fall_det.confidence,
@@ -218,6 +221,8 @@ class VisionPipeline:
                 persons=persons,
                 gesture=gesture_rec.latest_gesture,
                 fall=fall_state,
+                fall_region=fall_region,
+                poses=poses,
                 ir=pkt.ir_mode,
             )
             ws_server.update_state(state)
@@ -315,6 +320,36 @@ class VisionPipeline:
                 nh=(y2 - y1) / frame_h,
             ))
         return persons
+
+    def _build_fall_region(self, frame_w: int, frame_h: int) -> FallRegion | None:
+        if frame_w <= 0 or frame_h <= 0:
+            return None
+
+        rx, ry, rw, rh = fall_region_px(
+            frame_w,
+            frame_h,
+            aspect=self._cfg.fall_pose_aspect,
+        )
+        if rw <= 0 or rh <= 0:
+            return None
+
+        return FallRegion(
+            nx=rx / frame_w,
+            ny=ry / frame_h,
+            nw=rw / frame_w,
+            nh=rh / frame_h,
+        )
+
+    @staticmethod
+    def _build_poses(pose_tracks: Sequence[PoseTrackData]) -> list[dict[str, object]]:
+        poses: list[dict[str, object]] = []
+        for pose in pose_tracks:
+            points: dict[str, list[float]] = {}
+            for name, point in (pose.points or {}).items():
+                nx, ny, visibility = point
+                points[name] = [nx, ny, visibility]
+            poses.append({"id": pose.track_id, "points": points})
+        return poses
 
     def _estimate_fps(self, current_time):
         if self._last_state_time <= 0:

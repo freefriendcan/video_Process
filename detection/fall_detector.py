@@ -18,6 +18,7 @@ from detection.fall_geometry import fall_region_px
 
 BBox = tuple[int, int, int, int]
 Point = tuple[float, float]
+PosePoint = tuple[float, float, float]
 FallStateName = Literal["idle", "falling", "on_floor", "recovered"]
 
 
@@ -74,6 +75,7 @@ class PoseTrackData:
     crop_bbox: BBox
     left_wrist: Point | None
     right_wrist: Point | None
+    points: dict[str, PosePoint] | None = None
 
 
 @dataclass(frozen=True)
@@ -298,6 +300,7 @@ class FallDetector:
                 rgb_crop=pose_rgb,
                 person_bbox=bbox,
                 crop_bbox=pose_box,
+                frame_size=frame_size,
                 state=state,
                 current_time=current_time,
             )
@@ -320,6 +323,7 @@ class FallDetector:
                 track_id=track_id,
                 person_bbox=bbox,
                 crop_bbox=pose_box,
+                frame_size=frame_size,
                 state=state,
             )
             if extraction is not None:
@@ -389,6 +393,7 @@ class FallDetector:
         track_id: int,
         person_bbox: BBox,
         crop_bbox: BBox,
+        frame_size: tuple[int, int],
         state: FallTrackState,
     ) -> _PoseExtraction | None:
         results = self._pose_detector.process(rgb_crop)
@@ -408,7 +413,7 @@ class FallDetector:
         self._append_body_y(features, state)
         torso_angle_deg = self._compute_torso_angle(features)
         state.last_torso_angle_deg = torso_angle_deg
-        pose = self._pose_track_data(track_id, person_bbox, crop_bbox, landmarks)
+        pose = self._pose_track_data(track_id, person_bbox, crop_bbox, frame_size, landmarks)
 
         normalized = self._hip_centered_features(features)
         return _PoseExtraction(features=normalized, pose=pose, torso_angle_deg=torso_angle_deg)
@@ -508,6 +513,7 @@ class FallDetector:
         track_id: int,
         person_bbox: BBox,
         crop_bbox: BBox,
+        frame_size: tuple[int, int],
         landmarks: list[object],
     ) -> PoseTrackData:
         left_wrist = self._landmark_point(
@@ -524,6 +530,7 @@ class FallDetector:
             crop_bbox=crop_bbox,
             left_wrist=left_wrist,
             right_wrist=right_wrist,
+            points=self._pose_points(landmarks, crop_bbox, frame_size),
         )
 
     @staticmethod
@@ -536,12 +543,33 @@ class FallDetector:
         y = crop_y + float(getattr(landmark, "y")) * crop_h
         return x, y
 
+    def _pose_points(
+        self,
+        landmarks: list[object],
+        crop_bbox: BBox,
+        frame_size: tuple[int, int],
+    ) -> dict[str, PosePoint]:
+        frame_w, frame_h = frame_size
+        if frame_w <= 0 or frame_h <= 0:
+            return {}
+
+        crop_x, crop_y, crop_w, crop_h = crop_bbox
+        points: dict[str, PosePoint] = {}
+        for mp_enum, kp_name in self._MP_LANDMARK_MAP.items():
+            landmark = landmarks[mp_enum.value]
+            full_x = crop_x + float(getattr(landmark, "x")) * crop_w
+            full_y = crop_y + float(getattr(landmark, "y")) * crop_h
+            visibility = float(getattr(landmark, "visibility", 0.0))
+            points[kp_name] = (full_x / frame_w, full_y / frame_h, visibility)
+        return points
+
     def _run_detection(
         self,
         track_id: int,
         rgb_crop: np.ndarray,
         person_bbox: BBox,
         crop_bbox: BBox,
+        frame_size: tuple[int, int],
         state: FallTrackState,
         current_time: float,
     ) -> tuple[bool, float, PoseTrackData | None]:
@@ -556,6 +584,7 @@ class FallDetector:
             track_id=track_id,
             person_bbox=person_bbox,
             crop_bbox=crop_bbox,
+            frame_size=frame_size,
             state=state,
         )
         pose = extraction.pose if extraction is not None else None
