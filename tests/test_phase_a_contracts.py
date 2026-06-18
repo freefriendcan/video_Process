@@ -604,6 +604,8 @@ def test_ir_mode_skips_local_identity_dispatch():
 def test_tracker_manager_propagates_identified_face_to_containing_person():
     manager = TrackerManager.__new__(TrackerManager)
     manager._lock = threading.Lock()
+    manager._cfg = PipelineConfig()
+    manager._on_identity_event = None
     manager._trackers = {
         5: {
             "user": "Ada",
@@ -624,6 +626,309 @@ def test_tracker_manager_propagates_identified_face_to_containing_person():
     manager.propagate_identity()
 
     assert manager._person_tracks[7].user == "Ada"
+
+
+def _identity_manager(events: list[dict[str, object]]) -> TrackerManager:
+    manager = TrackerManager.__new__(TrackerManager)
+    manager._cfg = PipelineConfig()
+    manager._cfg.person_detection_interval = 0.15
+    manager._cfg.tracker_track_buffer = 30
+    manager._cfg.tracker_frame_rate = 30
+    manager._cfg.person_identity_eviction_s = 5.0
+    manager._lock = threading.Lock()
+    manager._trackers = {}
+    manager._person_tracks = {}
+    manager._person_reid_enabled = True
+    manager._on_identity_event = events.append
+    return manager
+
+
+def test_identity_event_emits_first_stamp_once_and_reidentify():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._trackers = {5: {"user": "Ada", "bbox": (40, 40, 20, 20)}}
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Unknown",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+        )
+    }
+
+    manager.propagate_identity()
+    manager.propagate_identity()
+    manager._trackers[5]["user"] = "Bob"
+    manager.propagate_identity()
+
+    assert [event["event_type"] for event in events] == [
+        "person_identified",
+        "person_identified",
+    ]
+    assert events[0]["track_id"] == 7
+    assert events[0]["user"] == "Ada"
+    assert "dwell_s" not in events[0]
+    assert events[1]["user"] == "Bob"
+    assert manager._person_tracks[7].user == "Bob"
+    assert manager._person_tracks[7].emitted_user == "Bob"
+    assert manager._person_tracks[7].first_identified_at is not None
+
+
+def test_identity_event_never_emits_or_downgrades_on_unknown_face():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._trackers = {5: {"user": "Unknown", "bbox": (40, 40, 20, 20)}}
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Ada",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+            first_identified_at=4.0,
+            emitted_user="Ada",
+        )
+    }
+
+    manager.propagate_identity()
+
+    assert events == []
+    assert manager._person_tracks[7].user == "Ada"
+    assert manager._person_tracks[7].emitted_user == "Ada"
+
+
+def test_identity_event_emits_left_with_dwell_on_evict():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Ada",
+            reid_ok=True,
+            last_seen=20.0,
+            confidence=0.9,
+            first_identified_at=12.0,
+            emitted_user="Ada",
+        )
+    }
+
+    manager._evict_stale_person_tracks(current_time=30.0)
+
+    assert manager._person_tracks == {}
+    assert len(events) == 1
+    assert events[0]["event_type"] == "person_left"
+    assert events[0]["track_id"] == 7
+    assert events[0]["user"] == "Ada"
+    assert events[0]["dwell_s"] == 8.0
+
+
+def test_identified_person_track_survives_short_occlusion():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Ada",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+            first_identified_at=4.0,
+            emitted_user="Ada",
+        )
+    }
+
+    manager._evict_stale_person_tracks(current_time=13.0)
+
+    assert 7 in manager._person_tracks
+    assert events == []
+
+
+def test_identified_person_track_evicts_after_identity_ttl():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Ada",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+            first_identified_at=4.0,
+            emitted_user="Ada",
+        )
+    }
+
+    manager._evict_stale_person_tracks(current_time=16.0)
+
+    assert manager._person_tracks == {}
+    assert len(events) == 1
+    assert events[0]["event_type"] == "person_left"
+    assert events[0]["track_id"] == 7
+    assert events[0]["user"] == "Ada"
+    assert events[0]["dwell_s"] == 6.0
+
+
+def test_unidentified_person_track_keeps_short_eviction_ttl():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Unknown",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+        )
+    }
+
+    manager._evict_stale_person_tracks(current_time=11.5)
+
+    assert manager._person_tracks == {}
+    assert events == []
+
+
+def test_identified_person_redetection_preserves_session_without_reidentify():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Ada",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+            first_identified_at=4.0,
+            emitted_user="Ada",
+        )
+    }
+
+    manager._evict_stale_person_tracks(current_time=13.0)
+    manager._apply_person_results(
+        np.asarray([[2, 3, 142, 223, 7, 0.91, 0, 0]], dtype=np.float32),
+        current_time=13.1,
+    )
+    manager._trackers = {5: {"user": "Ada", "bbox": (40, 40, 20, 20)}}
+    manager.propagate_identity()
+
+    record = manager._person_tracks[7]
+    assert record.user == "Ada"
+    assert record.emitted_user == "Ada"
+    assert record.first_identified_at == 4.0
+    assert record.last_seen == 13.1
+    assert events == []
+
+
+def test_identity_event_does_not_emit_left_for_never_identified_track():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Unknown",
+            reid_ok=True,
+            last_seen=20.0,
+            confidence=0.9,
+        )
+    }
+
+    manager._evict_stale_person_tracks(current_time=30.0)
+
+    assert manager._person_tracks == {}
+    assert events == []
+
+
+def test_identity_event_callback_runs_outside_tracker_lock():
+    events: list[dict[str, object]] = []
+    manager = _identity_manager(events)
+
+    def callback(event: dict[str, object]) -> None:
+        lock_was_free = manager._lock.acquire(blocking=False)
+        try:
+            assert lock_was_free
+            events.append(event)
+        finally:
+            if lock_was_free:
+                manager._lock.release()
+
+    manager._on_identity_event = callback
+    manager._trackers = {5: {"user": "Ada", "bbox": (40, 40, 20, 20)}}
+    manager._person_tracks = {
+        7: PersonTrackRecord(
+            track_id=7,
+            bbox=(0, 0, 140, 220),
+            user="Unknown",
+            reid_ok=True,
+            last_seen=10.0,
+            confidence=0.9,
+        )
+    }
+
+    manager.propagate_identity()
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "person_identified"
+
+
+def test_dispatcher_identity_event_is_default_off(monkeypatch):
+    monkeypatch.delenv("IDENTITY_EVENTS_ENABLED", raising=False)
+    called = False
+
+    def fake_post(*_args: object, **_kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("events.dispatcher.requests.post", fake_post)
+    cfg = PipelineConfig()
+    cfg.identity_events_enabled = False
+    dispatcher = EventDispatcher(cfg)
+    try:
+        dispatcher.send_identity_event({"event_type": "person_identified"})
+    finally:
+        dispatcher.shutdown()
+
+    assert called is False
+
+
+def test_dispatcher_identity_event_posts_when_enabled(monkeypatch):
+    monkeypatch.delenv("IDENTITY_EVENTS_ENABLED", raising=False)
+    sent: dict[str, object] = {}
+
+    def fake_post(url: str, json: dict[str, object], timeout: float):
+        sent["url"] = url
+        sent["json"] = json
+        sent["timeout"] = timeout
+        return types.SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("events.dispatcher.requests.post", fake_post)
+    cfg = PipelineConfig()
+    cfg.identity_events_enabled = True
+    dispatcher = EventDispatcher(cfg)
+    payload = {
+        "schema_version": "1.0",
+        "event_type": "person_identified",
+        "track_id": 7,
+        "user": "Ada",
+        "zone": "living_room",
+        "source": "mac_studio_living_room",
+        "ts_wall": "2026-06-18T00:00:00+00:00",
+    }
+    try:
+        dispatcher.send_identity_event(payload)
+    finally:
+        dispatcher.shutdown()
+
+    assert sent["url"] == cfg.identity_event_url
+    assert sent["json"] == payload
+    assert sent["timeout"] == 1.0
 
 
 def test_face_postprocess_parses_five_landmarks_from_20_channel_output():

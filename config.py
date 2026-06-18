@@ -67,6 +67,11 @@ class PipelineConfig:
     pi_ip: str = "100.105.136.5"
     pi_port: int = 8000
 
+    # Located-identity -> Pi session events (WS2). Default-off until coordinated.
+    identity_events_enabled: bool = False
+    identity_zone: str = "living_room"
+    identity_source: str = "mac_studio_living_room"
+
     # Model paths
     blaze_face_model: str = "blaze_face_short_range.tflite"
     gesture_model: str = "gesture_recognizer.task"
@@ -114,6 +119,7 @@ class PipelineConfig:
     tracker_cmc_method: str = "ecc"
     tracker_track_buffer: int = 30
     tracker_frame_rate: int = 30
+    person_identity_eviction_s: float = 5.0
 
     # Gesture
     gesture_cooldown: float = 1.0
@@ -171,6 +177,10 @@ class PipelineConfig:
     def gesture_url(self) -> str:
         return f"http://{self.pi_ip}:{self.pi_port}/vision/gesture"
 
+    @property
+    def identity_event_url(self) -> str:
+        return f"http://{self.pi_ip}:{self.pi_port}/vision/identity_event"
+
     def __post_init__(self):
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -205,6 +215,14 @@ class PipelineConfig:
         self.ws_vision_port = _env_int("WS_VISION_PORT", self.ws_vision_port)
         self.ws_vision_fps = _env_float("WS_VISION_FPS", self.ws_vision_fps)
         self.fall_pose_aspect = _env_float("FALL_POSE_ASPECT", self.fall_pose_aspect)
+        self.person_identity_eviction_s = _env_float(
+            "PERSON_IDENTITY_EVICTION_S",
+            self.person_identity_eviction_s,
+        )
+        self.identity_events_enabled = _env_bool(
+            "IDENTITY_EVENTS_ENABLED",
+            self.identity_events_enabled,
+        )
 
         if self.go2rtc_enabled:
             self.rtsp_url = (

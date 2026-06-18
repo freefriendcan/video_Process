@@ -49,7 +49,13 @@ class VisionPipeline:
         self._cfg = cfg
         self._quality_gate = FaceQualityGate(cfg)
         self._dispatcher = EventDispatcher(cfg)
-        self._tracker_mgr = TrackerManager(cfg)
+        self._tracker_mgr = TrackerManager(
+            cfg,
+            on_identity_event=lambda event: self._dispatcher.submit(
+                self._dispatcher.send_identity_event,
+                event,
+            ),
+        )
         self._producer = FrameProducer(cfg)
         self._ws_server = VisionWSServer(cfg)
         self._person_det = PersonDetector(cfg)

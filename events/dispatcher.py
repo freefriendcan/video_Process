@@ -27,6 +27,20 @@ class EventDispatcher:
         except Exception as e:
             logger.error("Fall alert send error: {}", e)
 
+    def send_identity_event(self, payload: Mapping[str, object]) -> None:
+        if not self._cfg.identity_events_enabled:
+            return
+
+        try:
+            resp = requests.post(self._cfg.identity_event_url, json=dict(payload), timeout=1.0)
+            logger.info(
+                "Identity event sent: {} -> {}",
+                payload.get("event_type"),
+                resp.status_code,
+            )
+        except Exception as e:
+            logger.warning("Identity event send error: {}", e)
+
     def send_gesture_event(self, gesture_name, duration, user_name="Unknown"):
         try:
             payload = {

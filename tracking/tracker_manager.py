@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol, cast
 
 import numpy as np
@@ -14,6 +16,7 @@ from detection.onnx_runtime import NormalizedKeypoint
 
 BBox = tuple[int, int, int, int]
 PersonDetection = tuple[BBox, float]
+IdentityEventPayload = dict[str, object]
 
 
 @dataclass
@@ -24,6 +27,8 @@ class PersonTrackRecord:
     reid_ok: bool
     last_seen: float
     confidence: float
+    first_identified_at: float | None = None
+    emitted_user: str | None = None
 
 
 class _MotTracker(Protocol):
@@ -37,13 +42,18 @@ class _MotTracker(Protocol):
 
 
 class TrackerManager:
-    def __init__(self, cfg: PipelineConfig):
+    def __init__(
+        self,
+        cfg: PipelineConfig,
+        on_identity_event: Callable[[IdentityEventPayload], None] | None = None,
+    ):
         self._cfg = cfg
         self._trackers: dict[int, dict[str, Any]] = {}
         self._face_mot = self._build_face_tracker(cfg)
         self._person_tracks: dict[int, PersonTrackRecord] = {}
         self._person_reid_enabled = cfg.tracker_type.lower() == "botsort"
         self._person_mot = self._build_person_tracker(cfg)
+        self._on_identity_event = on_identity_event
         self._lock = threading.Lock()
 
     @staticmethod
@@ -305,6 +315,10 @@ class TrackerManager:
             with self._lock:
                 existing = self._person_tracks.get(track_id)
                 user = existing.user if existing is not None else "Unknown"
+                first_identified_at = (
+                    existing.first_identified_at if existing is not None else None
+                )
+                emitted_user = existing.emitted_user if existing is not None else None
                 self._person_tracks[track_id] = PersonTrackRecord(
                     track_id=track_id,
                     bbox=bbox,
@@ -312,6 +326,8 @@ class TrackerManager:
                     reid_ok=self._person_reid_enabled,
                     last_seen=current_time,
                     confidence=confidence,
+                    first_identified_at=first_identified_at,
+                    emitted_user=emitted_user,
                 )
 
     @staticmethod
@@ -324,19 +340,34 @@ class TrackerManager:
         return x, y, w, h
 
     def _evict_stale_person_tracks(self, current_time: float) -> None:
-        ttl = max(
+        base_ttl = max(
             self._cfg.person_detection_interval * 2.0,
             self._cfg.tracker_track_buffer / max(1.0, float(self._cfg.tracker_frame_rate)),
         )
+        identity_ttl = max(base_ttl, self._cfg.person_identity_eviction_s)
+        pending: list[IdentityEventPayload] = []
         with self._lock:
             stale_track_ids = [
                 track_id
                 for track_id, record in self._person_tracks.items()
-                if current_time - record.last_seen > ttl
+                if current_time - record.last_seen
+                > (identity_ttl if record.emitted_user is not None else base_ttl)
             ]
             for track_id in stale_track_ids:
+                record = self._person_tracks[track_id]
+                if record.emitted_user is not None:
+                    dwell_s = max(
+                        0.0,
+                        record.last_seen - (record.first_identified_at or record.last_seen),
+                    )
+                    pending.append(
+                        self._identity_payload("person_left", record, dwell_s=dwell_s)
+                    )
                 logger.debug("[person:{}] MOT track expired — removing identity state", track_id)
                 del self._person_tracks[track_id]
+
+        for event in pending:
+            self._emit_identity(event)
 
     def _evict_stale_face_tracks(self, current_time: float) -> None:
         ttl = max(
@@ -373,6 +404,7 @@ class TrackerManager:
 
     def propagate_identity(self) -> None:
         """Stamp recognized face identities onto containing person tracks."""
+        pending: list[IdentityEventPayload] = []
         with self._lock:
             face_snapshot = {
                 track_id: dict(data)
@@ -405,11 +437,44 @@ class TrackerManager:
                 record = self._person_tracks.get(matched_person_id)
                 if record is not None and record.user != user:
                     record.user = user
+                    if record.emitted_user != user:
+                        if record.first_identified_at is None:
+                            record.first_identified_at = time.time()
+                        record.emitted_user = user
+                        pending.append(self._identity_payload("person_identified", record))
                     logger.info(
                         "[person:{}] Identity propagated from face track: {}",
                         matched_person_id,
                         user,
                     )
+
+        for event in pending:
+            self._emit_identity(event)
+
+    def _identity_payload(
+        self,
+        event_type: str,
+        record: PersonTrackRecord,
+        dwell_s: float | None = None,
+    ) -> IdentityEventPayload:
+        payload: IdentityEventPayload = {
+            "schema_version": "1.0",
+            "event_type": event_type,
+            "track_id": record.track_id,
+            "user": record.emitted_user or record.user,
+            "zone": self._cfg.identity_zone,
+            "source": self._cfg.identity_source,
+            "ts_wall": datetime.now(timezone.utc).isoformat(),
+        }
+        if dwell_s is not None:
+            payload["dwell_s"] = round(dwell_s, 1)
+        return payload
+
+    def _emit_identity(self, event: IdentityEventPayload) -> None:
+        if self._on_identity_event is not None:
+            self._on_identity_event(event)
+            return
+        logger.info("[identity-event] {}", event)
 
     @staticmethod
     def _bbox_contains_point(bbox: BBox, point: tuple[float, float]) -> bool:
