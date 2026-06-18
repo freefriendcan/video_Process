@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pickle
 import sys
 import threading
@@ -439,6 +440,7 @@ def test_fall_alert_payload_has_action_schema_without_top_level_confidence():
     state.fall_state = "on_floor"
     state.last_body_velocity = 0.041
     state.last_torso_angle_deg = 78.0
+    state.confidence = 0.93456
 
     payload = detector._build_alert_payload(
         track_id=7,
@@ -457,6 +459,7 @@ def test_fall_alert_payload_has_action_schema_without_top_level_confidence():
     assert payload["centroid"] == [60.0, 120.0]
     assert payload["frame_size"] == [1280, 720]
     assert payload["diagnostics"]["body_velocity"] == 0.041
+    assert payload["diagnostics"]["fall_probability"] == 0.9346
     assert payload["media"]["snapshot_path"] == "data/logs/screenshots/fall_7.jpg"
     assert "confidence" not in payload
 
@@ -479,10 +482,9 @@ def test_fall_track_states_are_independent():
 def test_dispatcher_sends_fall_alert_as_json_without_confidence(monkeypatch):
     sent: dict[str, object] = {}
 
-    def fake_post(url: str, json: dict[str, object], timeout: float):
+    def fake_post(url: str, **kwargs: object):
         sent["url"] = url
-        sent["json"] = json
-        sent["timeout"] = timeout
+        sent.update(kwargs)
         return types.SimpleNamespace(status_code=200)
 
     monkeypatch.setattr("events.dispatcher.requests.post", fake_post)
@@ -501,7 +503,44 @@ def test_dispatcher_sends_fall_alert_as_json_without_confidence(monkeypatch):
 
     assert sent["url"].endswith("/vision/fall_alert")
     assert sent["json"]["track_id"] == 3
+    assert sent["timeout"] == 3.0
+    assert "files" not in sent
+    assert "data" not in sent
     assert "confidence" not in sent["json"]
+
+
+def test_dispatcher_sends_fall_alert_as_multipart_with_screenshot(monkeypatch):
+    sent: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object):
+        sent["url"] = url
+        sent.update(kwargs)
+        return types.SimpleNamespace(status_code=200)
+
+    payload = {
+        "schema_version": "1.0",
+        "event_type": "fall",
+        "track_id": 3,
+        "fall_state": "on_floor",
+        "diagnostics": {"fall_probability": 0.93},
+    }
+
+    monkeypatch.setattr("events.dispatcher.requests.post", fake_post)
+    dispatcher = EventDispatcher(PipelineConfig())
+    try:
+        dispatcher.send_fall_alert(payload, screenshot_bytes=b"jpeg-bytes")
+    finally:
+        dispatcher.shutdown()
+
+    assert sent["url"].endswith("/vision/fall_alert")
+    assert sent["timeout"] == 5.0
+    assert "json" not in sent
+    data = sent["data"]
+    assert isinstance(data, dict)
+    assert json.loads(data["payload"]) == payload
+    files = sent["files"]
+    assert isinstance(files, dict)
+    assert files["screenshot"] == ("fall.jpg", b"jpeg-bytes", "image/jpeg")
 
 
 def test_gesture_payload_contract_unchanged(monkeypatch):

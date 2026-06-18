@@ -200,7 +200,11 @@ class VisionPipeline:
                 if fall_result.pose is not None:
                     pose_tracks.append(fall_result.pose)
                 if fall_result.alert is not None:
-                    dispatcher.submit(dispatcher.send_fall_alert, fall_result.alert)
+                    dispatcher.submit(
+                        dispatcher.send_fall_alert,
+                        fall_result.alert,
+                        fall_result.snapshot_bytes,
+                    )
 
             gesture_rec.process(rgb_frame, current_time, pose_tracks)
             gesture_rec.clear_stale(current_time)

@@ -46,6 +46,7 @@ class FallDiagnostics(TypedDict):
     body_velocity: float
     torso_angle_deg: float
     inactivity_elapsed_s: float
+    fall_probability: float
 
 
 class FallMedia(TypedDict):
@@ -84,6 +85,7 @@ class FallProcessingResult:
     bbox: BBox
     pose: PoseTrackData | None = None
     alert: FallAlertPayload | None = None
+    snapshot_bytes: bytes | None = None
 
 
 @dataclass
@@ -293,6 +295,7 @@ class FallDetector:
 
         pose: PoseTrackData | None = None
         alert: FallAlertPayload | None = None
+        snapshot_bytes: bytes | None = None
 
         if state.verification_state == self._STATE_IDLE:
             is_fall, fall_prob, pose = self._run_detection(
@@ -343,6 +346,8 @@ class FallDetector:
                     self._cfg.post_fall_wait,
                     state.verification_prob,
                 )
+                ok, buf = cv2.imencode(".jpg", bgr_frame)
+                snapshot_bytes = buf.tobytes() if ok else None
                 screenshot_path = self._save_screenshot(bgr_frame)
                 alert = self._build_alert_payload(
                     track_id=track_id,
@@ -366,7 +371,13 @@ class FallDetector:
                 state.status = f"Verifying fall ({elapsed:.1f}/{self._cfg.post_fall_wait}s)..."
 
         self._refresh_public_status()
-        return FallProcessingResult(track_id=track_id, bbox=bbox, pose=pose, alert=alert)
+        return FallProcessingResult(
+            track_id=track_id,
+            bbox=bbox,
+            pose=pose,
+            alert=alert,
+            snapshot_bytes=snapshot_bytes,
+        )
 
     def _state_for(self, track_id: int) -> FallTrackState:
         if track_id not in self._track_states:
@@ -678,6 +689,7 @@ class FallDetector:
                 "body_velocity": float(state.last_body_velocity),
                 "torso_angle_deg": float(state.last_torso_angle_deg),
                 "inactivity_elapsed_s": float(inactivity_elapsed_s),
+                "fall_probability": round(float(state.confidence), 4),
             },
             "ts_wall": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "ts_monotonic": time.monotonic(),

@@ -1,3 +1,4 @@
+import json
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -20,9 +21,21 @@ class EventDispatcher:
     def shutdown(self, wait=False):
         self._executor.shutdown(wait=wait)
 
-    def send_fall_alert(self, payload: Mapping[str, object]) -> None:
+    def send_fall_alert(
+        self,
+        payload: Mapping[str, object],
+        screenshot_bytes: bytes | None = None,
+    ) -> None:
         try:
-            resp = requests.post(self._cfg.fall_alert_url, json=dict(payload), timeout=3.0)
+            if screenshot_bytes:
+                resp = requests.post(
+                    self._cfg.fall_alert_url,
+                    data={"payload": json.dumps(dict(payload))},
+                    files={"screenshot": ("fall.jpg", screenshot_bytes, "image/jpeg")},
+                    timeout=5.0,
+                )
+            else:
+                resp = requests.post(self._cfg.fall_alert_url, json=dict(payload), timeout=3.0)
             logger.info("Fall alert sent to backend: {}", resp.status_code)
         except Exception as e:
             logger.error("Fall alert send error: {}", e)
