@@ -124,6 +124,7 @@ class PipelineConfig:
     fall_input_timesteps: int = 30
     fall_confidence_threshold: float = 0.90
     fall_alert_cooldown: int = 10
+    fall_pose_aspect: float = 4.0 / 3.0
     target_fall_fps: int = 15
     screenshot_dir: Path = field(default_factory=lambda: Path("data/logs/screenshots"))
 
@@ -203,6 +204,7 @@ class PipelineConfig:
         self.ws_vision_host = os.environ.get("WS_VISION_HOST", self.ws_vision_host)
         self.ws_vision_port = _env_int("WS_VISION_PORT", self.ws_vision_port)
         self.ws_vision_fps = _env_float("WS_VISION_FPS", self.ws_vision_fps)
+        self.fall_pose_aspect = _env_float("FALL_POSE_ASPECT", self.fall_pose_aspect)
 
         if self.go2rtc_enabled:
             self.rtsp_url = (

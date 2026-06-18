@@ -4,6 +4,7 @@ import pickle
 import sys
 import threading
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ import pytest
 from config import PipelineConfig
 from detection.face_detector import FaceDetector
 from detection.fall_detector import FallDetector, FallTrackState
+from detection.fall_geometry import fall_region_px
 from detection.onnx_runtime import LetterboxMeta, NormalizedKeypoint, OnnxModel, YoloDetection
 from detection.person_detector import PersonDetector
 from events.dispatcher import EventDispatcher
@@ -264,6 +266,168 @@ def test_face_bytetrack_evicts_stale_tracks():
 
     assert active == []
     assert manager.exists(4) is False
+
+
+def test_fall_region_px_returns_centered_four_three_crop():
+    assert fall_region_px(1280, 720) == (160, 0, 960, 720)
+
+    portrait = fall_region_px(720, 1280)
+    assert portrait == (0, 370, 720, 540)
+    assert portrait[2] / portrait[3] == pytest.approx(4.0 / 3.0, abs=0.01)
+
+    assert fall_region_px(1280, 720, aspect=0.0) == (0, 0, 1280, 720)
+    assert fall_region_px(0, 720) == (0, 0, 0, 720)
+
+
+@dataclass(frozen=True)
+class FakePoseLandmark:
+    x: float
+    y: float
+    visibility: float
+
+
+class FakePoseDetector:
+    def __init__(self, landmarks: list[FakePoseLandmark]) -> None:
+        self._landmarks = landmarks
+        self.images: list[np.ndarray] = []
+
+    def process(self, image: np.ndarray) -> object:
+        self.images.append(image)
+        return types.SimpleNamespace(
+            pose_landmarks=types.SimpleNamespace(landmark=self._landmarks),
+        )
+
+
+class FakeFallInterpreter:
+    def allocate_tensors(self) -> None:
+        pass
+
+    def get_input_details(self) -> list[dict[str, object]]:
+        return [{"index": 0}]
+
+    def get_output_details(self) -> list[dict[str, object]]:
+        return [{"index": 0}]
+
+    def set_tensor(self, tensor_index: int, value: np.ndarray) -> None:
+        pass
+
+    def invoke(self) -> None:
+        pass
+
+    def get_tensor(self, tensor_index: int) -> np.ndarray:
+        return np.asarray([[0.0]], dtype=np.float32)
+
+
+def _fall_detector_for_crop_test(pose_detector: FakePoseDetector) -> FallDetector:
+    import mediapipe as mp
+
+    detector = FallDetector.__new__(FallDetector)
+    detector._cfg = PipelineConfig()
+    detector._mp_pose = mp.solutions.pose
+    detector._pose_detector = pose_detector
+    detector._SORT_KP_NAMES = sorted(
+        [
+            "Nose",
+            "Left Eye",
+            "Right Eye",
+            "Left Ear",
+            "Right Ear",
+            "Left Shoulder",
+            "Right Shoulder",
+            "Left Elbow",
+            "Right Elbow",
+            "Left Wrist",
+            "Right Wrist",
+            "Left Hip",
+            "Right Hip",
+            "Left Knee",
+            "Right Knee",
+            "Left Ankle",
+            "Right Ankle",
+        ]
+    )
+    detector._SKP_IDX = {
+        name: index for index, name in enumerate(detector._SORT_KP_NAMES)
+    }
+    detector._NUM_FEAT = len(detector._SORT_KP_NAMES) * 3
+    detector._MP_LANDMARK_MAP = {
+        detector._mp_pose.PoseLandmark.NOSE: "Nose",
+        detector._mp_pose.PoseLandmark.LEFT_EYE: "Left Eye",
+        detector._mp_pose.PoseLandmark.RIGHT_EYE: "Right Eye",
+        detector._mp_pose.PoseLandmark.LEFT_EAR: "Left Ear",
+        detector._mp_pose.PoseLandmark.RIGHT_EAR: "Right Ear",
+        detector._mp_pose.PoseLandmark.LEFT_SHOULDER: "Left Shoulder",
+        detector._mp_pose.PoseLandmark.RIGHT_SHOULDER: "Right Shoulder",
+        detector._mp_pose.PoseLandmark.LEFT_ELBOW: "Left Elbow",
+        detector._mp_pose.PoseLandmark.RIGHT_ELBOW: "Right Elbow",
+        detector._mp_pose.PoseLandmark.LEFT_WRIST: "Left Wrist",
+        detector._mp_pose.PoseLandmark.RIGHT_WRIST: "Right Wrist",
+        detector._mp_pose.PoseLandmark.LEFT_HIP: "Left Hip",
+        detector._mp_pose.PoseLandmark.RIGHT_HIP: "Right Hip",
+        detector._mp_pose.PoseLandmark.LEFT_KNEE: "Left Knee",
+        detector._mp_pose.PoseLandmark.RIGHT_KNEE: "Right Knee",
+        detector._mp_pose.PoseLandmark.LEFT_ANKLE: "Left Ankle",
+        detector._mp_pose.PoseLandmark.RIGHT_ANKLE: "Right Ankle",
+    }
+    detector._interpreter = FakeFallInterpreter()
+    detector._input_details = [{"index": 0}]
+    detector._output_details = [{"index": 0}]
+    detector._track_states = {}
+    detector.status = ""
+    detector.confidence = 0.0
+    return detector
+
+
+def _fake_pose_landmarks() -> list[FakePoseLandmark]:
+    import mediapipe as mp
+
+    pose_enum = mp.solutions.pose.PoseLandmark
+    landmarks = [FakePoseLandmark(0.0, 0.0, 0.0) for _ in range(33)]
+    landmarks[pose_enum.NOSE.value] = FakePoseLandmark(0.25, 0.20, 1.0)
+    landmarks[pose_enum.LEFT_SHOULDER.value] = FakePoseLandmark(0.45, 0.40, 1.0)
+    landmarks[pose_enum.RIGHT_SHOULDER.value] = FakePoseLandmark(0.55, 0.40, 1.0)
+    landmarks[pose_enum.LEFT_HIP.value] = FakePoseLandmark(0.45, 0.60, 1.0)
+    landmarks[pose_enum.RIGHT_HIP.value] = FakePoseLandmark(0.55, 0.60, 1.0)
+    landmarks[pose_enum.LEFT_WRIST.value] = FakePoseLandmark(0.50, 0.50, 1.0)
+    landmarks[pose_enum.RIGHT_WRIST.value] = FakePoseLandmark(0.50, 0.50, 1.0)
+    return landmarks
+
+
+def test_fall_detector_feeds_pose_contiguous_four_three_crop():
+    pose_detector = FakePoseDetector(_fake_pose_landmarks())
+    detector = _fall_detector_for_crop_test(pose_detector)
+
+    result = detector.process_track(
+        track_id=3,
+        rgb_frame=np.zeros((720, 1280, 3), dtype=np.uint8),
+        bgr_frame=np.zeros((720, 1280, 3), dtype=np.uint8),
+        bbox=(10, 20, 100, 200),
+        frame_size=(1280, 720),
+        current_time=10.0,
+    )
+
+    pose_input = pose_detector.images[0]
+    assert pose_input.shape == (720, 960, 3)
+    assert pose_input.flags.c_contiguous
+    assert result.bbox == (10, 20, 100, 200)
+    assert result.pose is not None
+    assert result.pose.crop_bbox == (160, 0, 960, 720)
+    assert result.pose.left_wrist == pytest.approx((640.0, 360.0))
+    assert result.pose.right_wrist == pytest.approx((640.0, 360.0))
+
+    state = detector._track_states[3]
+    model_features = state.feature_buffer[-1]
+    nose_x, nose_y, _nose_conf = detector._kp_idx("Nose")
+
+    expected_cropped_x_feature = (0.25 - 0.50) / 0.20
+    pre_crop_full_frame_x = (160.0 + 0.25 * 960.0) / 1280.0
+    pre_crop_x_feature = (pre_crop_full_frame_x - 0.50) / 0.20
+    expected_y_feature = (0.20 - 0.60) / 0.20
+
+    assert model_features[nose_x] == pytest.approx(expected_cropped_x_feature)
+    assert abs(float(model_features[nose_x]) - pre_crop_x_feature) > 0.1
+    assert model_features[nose_y] == pytest.approx(expected_y_feature)
+    assert state.velocity_y_buffer[-1] == pytest.approx(0.50)
 
 
 def test_fall_alert_payload_has_action_schema_without_top_level_confidence():

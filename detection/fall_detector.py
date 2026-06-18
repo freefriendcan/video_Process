@@ -14,6 +14,7 @@ import numpy as np
 from loguru import logger
 
 from config import PipelineConfig
+from detection.fall_geometry import fall_region_px
 
 BBox = tuple[int, int, int, int]
 Point = tuple[float, float]
@@ -277,18 +278,13 @@ class FallDetector:
             return FallProcessingResult(track_id=track_id, bbox=bbox)
         state.last_process_time = current_time
 
-        # DECISION (Phase A, C4-safe): the frozen TFLite transformer was trained
-        # *and* originally deployed (legacy mac_camera.py) on FULL-FRAME
-        # MediaPipe-Pose features. Hip-centering + torso-scaling removes
-        # translation and uniform scale but NOT aspect-ratio distortion, so
-        # feeding a person-bbox CROP (different aspect ratio than 720p) would
-        # shift the feature distribution the model never saw. We therefore run
-        # Pose on the full frame and use the person box only to GATE execution
-        # (we are here only because a person track exists -> no Pose on empty
-        # rooms). The full-frame coords double as the wrist mapping box.
+        # Restore the legacy 4:3 Pose geometry used by the frozen transformer.
+        # The person bbox still only gates fall execution and remains the alert
+        # bbox; the crop box maps Pose wrists back into full-frame coordinates.
         frame_w, frame_h = frame_size
-        pose_rgb = rgb_frame
-        pose_box: BBox = (0, 0, frame_w, frame_h)
+        rx, ry, rw, rh = fall_region_px(frame_w, frame_h, aspect=self._cfg.fall_pose_aspect)
+        pose_rgb = np.ascontiguousarray(rgb_frame[ry : ry + rh, rx : rx + rw])
+        pose_box: BBox = (rx, ry, rw, rh)
         if pose_rgb.size == 0:
             state.status = "Empty frame"
             return FallProcessingResult(track_id=track_id, bbox=bbox)
