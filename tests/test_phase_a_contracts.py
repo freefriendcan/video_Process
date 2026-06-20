@@ -15,6 +15,7 @@ from config import PipelineConfig
 from detection.face_detector import FaceDetector
 from detection.fall_detector import FallDetector, FallTrackState
 from detection.fall_geometry import fall_region_px
+from detection.gesture_recognizer import GestureRecognizer
 from detection.onnx_runtime import LetterboxMeta, NormalizedKeypoint, OnnxModel, YoloDetection
 from detection.person_detector import PersonDetector
 from events.dispatcher import EventDispatcher
@@ -394,6 +395,80 @@ def _fake_pose_landmarks() -> list[FakePoseLandmark]:
     return landmarks
 
 
+def _fall_detector_for_frontality_test() -> FallDetector:
+    import mediapipe as mp
+
+    detector = FallDetector.__new__(FallDetector)
+    detector._cfg = PipelineConfig()
+    detector._mp_pose = mp.solutions.pose
+    return detector
+
+
+def _frontality_landmarks(
+    *,
+    left_eye_x: float,
+    right_eye_x: float,
+    right_eye_visibility: float = 1.0,
+) -> list[object]:
+    import mediapipe as mp
+
+    pose_enum = mp.solutions.pose.PoseLandmark
+    landmarks = [
+        types.SimpleNamespace(x=0.0, y=0.0, visibility=1.0)
+        for _ in range(33)
+    ]
+    landmarks[pose_enum.NOSE.value] = types.SimpleNamespace(x=0.5, y=0.2, visibility=1.0)
+    landmarks[pose_enum.LEFT_EYE.value] = types.SimpleNamespace(
+        x=left_eye_x,
+        y=0.18,
+        visibility=1.0,
+    )
+    landmarks[pose_enum.RIGHT_EYE.value] = types.SimpleNamespace(
+        x=right_eye_x,
+        y=0.18,
+        visibility=right_eye_visibility,
+    )
+    landmarks[pose_enum.LEFT_SHOULDER.value] = types.SimpleNamespace(
+        x=0.3,
+        y=0.45,
+        visibility=1.0,
+    )
+    landmarks[pose_enum.RIGHT_SHOULDER.value] = types.SimpleNamespace(
+        x=0.7,
+        y=0.45,
+        visibility=1.0,
+    )
+    return landmarks
+
+
+def test_pose_is_frontal_true_when_facing_camera():
+    detector = _fall_detector_for_frontality_test()
+
+    assert detector._pose_is_frontal(
+        _frontality_landmarks(left_eye_x=0.4, right_eye_x=0.6),
+    ) is True
+
+
+def test_pose_is_frontal_false_on_profile():
+    detector = _fall_detector_for_frontality_test()
+
+    assert detector._pose_is_frontal(
+        _frontality_landmarks(
+            left_eye_x=0.4,
+            right_eye_x=0.6,
+            right_eye_visibility=0.1,
+        ),
+    ) is False
+
+
+def test_pose_is_frontal_false_when_eyes_too_close():
+    detector = _fall_detector_for_frontality_test()
+
+    assert detector._pose_is_frontal(
+        _frontality_landmarks(left_eye_x=0.45, right_eye_x=0.55),
+    ) is False
+
+
 def test_fall_detector_feeds_pose_contiguous_four_three_crop():
     pose_detector = FakePoseDetector(_fake_pose_landmarks())
     detector = _fall_detector_for_crop_test(pose_detector)
@@ -665,6 +740,115 @@ def test_tracker_manager_propagates_identified_face_to_containing_person():
     manager.propagate_identity()
 
     assert manager._person_tracks[7].user == "Ada"
+
+
+def _person_identity_resolver_manager(
+    records: dict[int, PersonTrackRecord],
+) -> TrackerManager:
+    manager = TrackerManager.__new__(TrackerManager)
+    manager._lock = threading.Lock()
+    manager._person_tracks = records
+    return manager
+
+
+def test_user_for_person_track_resolves_named_person():
+    manager = _person_identity_resolver_manager(
+        {
+            7: PersonTrackRecord(
+                track_id=7,
+                bbox=(0, 0, 140, 220),
+                user="Ada",
+                reid_ok=True,
+                last_seen=10.0,
+                confidence=0.9,
+                emitted_user="Ada",
+            )
+        }
+    )
+
+    assert manager.user_for_person_track(7) == "Ada"
+
+
+def test_user_for_person_track_unknown_when_track_unidentified():
+    manager = _person_identity_resolver_manager(
+        {
+            7: PersonTrackRecord(
+                track_id=7,
+                bbox=(0, 0, 140, 220),
+                user="Unknown",
+                reid_ok=True,
+                last_seen=10.0,
+                confidence=0.9,
+            )
+        }
+    )
+
+    assert manager.user_for_person_track(7) == "Unknown"
+
+
+def test_user_for_person_track_missing_track_returns_unknown():
+    manager = _person_identity_resolver_manager({})
+
+    assert manager.user_for_person_track(999) == "Unknown"
+
+
+def test_user_for_person_track_none_falls_back_to_any_identified():
+    manager = _person_identity_resolver_manager(
+        {
+            7: PersonTrackRecord(
+                track_id=7,
+                bbox=(0, 0, 140, 220),
+                user="Ada",
+                reid_ok=True,
+                last_seen=10.0,
+                confidence=0.9,
+                emitted_user="Ada",
+            )
+        }
+    )
+
+    assert manager.user_for_person_track(None) == "Ada"
+
+
+def test_raw_hand_bbox_returns_pose_track_id():
+    recognizer = GestureRecognizer.__new__(GestureRecognizer)
+    recognizer._cfg = PipelineConfig()
+    pose = types.SimpleNamespace(
+        track_id=7,
+        bbox=(10, 20, 40, 60),
+        left_wrist=None,
+        right_wrist=(50.0, 60.0),
+    )
+
+    result = recognizer._raw_hand_bbox(
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        [pose],
+    )
+
+    assert result == ((32, 42, 36, 36), 7)
+
+
+def test_process_submits_every_frame_without_inflight_gate():
+    recognizer = GestureRecognizer.__new__(GestureRecognizer)
+    recognizer._cfg = PipelineConfig()
+    recognizer._last_timestamp_ms = 0
+    recognizer._async_image_buffer = []
+    recognizer._pending_track_id = None
+    recognizer._smoothed_hand_bbox = None
+    calls: list[int] = []
+
+    class FakeRecognizer:
+        def recognize_async(self, _image: object, timestamp_ms: int) -> None:
+            calls.append(timestamp_ms)
+
+    recognizer._recognizer = FakeRecognizer()
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    recognizer.process(frame, 1.0, None)
+    recognizer.process(frame, 1.1, None)
+
+    assert calls == [1000, 1100]
+    assert hasattr(recognizer, "_is_processing") is False
 
 
 def _identity_manager(events: list[dict[str, object]]) -> TrackerManager:

@@ -139,6 +139,8 @@ class PipelineConfig:
     fall_confidence_threshold: float = 0.90
     fall_alert_cooldown: int = 10
     fall_pose_aspect: float = 4.0 / 3.0
+    pose_frontal_min_visibility: float = 0.5
+    pose_frontal_eye_shoulder_ratio: float = 0.30
     target_fall_fps: int = 15
     screenshot_dir: Path = field(default_factory=lambda: Path("data/logs/screenshots"))
 

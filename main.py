@@ -141,7 +141,6 @@ class VisionPipeline:
         sys.exit(0)
 
     def _camera_loop(self):
-        quality_gate = self._quality_gate
         dispatcher = self._dispatcher
         tracker_mgr = self._tracker_mgr
         gesture_rec = self._gesture_rec
@@ -179,17 +178,8 @@ class VisionPipeline:
 
             for t in active:
                 t_id = t["id"]
-                x, y, w, h = t["bbox"]
                 user = t["user"]
                 if user not in ["Unknown", "Identifying..."]:
-                    is_frontal = quality_gate.estimate_frontality(
-                        t["detection_keypoints"],
-                        frame_w,
-                        frame_h,
-                        (x, y, w, h),
-                    )
-                    gesture_rec.is_frontal = is_frontal
-
                     if current_time - t["last_json_time"] > 3.0:
                         dispatcher.submit(dispatcher.send_presence, user)
                         tracker_mgr.update_field(t_id, last_json_time=current_time)
@@ -231,6 +221,8 @@ class VisionPipeline:
                         fall_result.snapshot_bytes,
                     )
 
+            if pose_tracks:
+                gesture_rec.is_frontal = any(pose.frontal for pose in pose_tracks)
             gesture_rec.process(rgb_frame, current_time, pose_tracks)
             gesture_rec.clear_stale(current_time)
 

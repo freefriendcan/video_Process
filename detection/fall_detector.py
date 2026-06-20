@@ -77,6 +77,7 @@ class PoseTrackData:
     left_wrist: Point | None
     right_wrist: Point | None
     points: dict[str, PosePoint] | None = None
+    frontal: bool = False
 
 
 @dataclass(frozen=True)
@@ -542,7 +543,28 @@ class FallDetector:
             left_wrist=left_wrist,
             right_wrist=right_wrist,
             points=self._pose_points(landmarks, crop_bbox, frame_size),
+            frontal=self._pose_is_frontal(landmarks),
         )
+
+    def _pose_is_frontal(self, landmarks: list[object]) -> bool:
+        lm = self._mp_pose.PoseLandmark
+        nose = landmarks[lm.NOSE.value]
+        le = landmarks[lm.LEFT_EYE.value]
+        re = landmarks[lm.RIGHT_EYE.value]
+        ls = landmarks[lm.LEFT_SHOULDER.value]
+        rs = landmarks[lm.RIGHT_SHOULDER.value]
+
+        vis_min = self._cfg.pose_frontal_min_visibility
+        required = (nose, le, re, ls, rs)
+        if min(float(getattr(point, "visibility", 0.0)) for point in required) < vis_min:
+            return False
+
+        shoulder_dx = abs(float(getattr(ls, "x", 0.0)) - float(getattr(rs, "x", 0.0)))
+        if shoulder_dx <= 1e-6:
+            return False
+
+        eye_dx = abs(float(getattr(le, "x", 0.0)) - float(getattr(re, "x", 0.0)))
+        return (eye_dx / shoulder_dx) >= self._cfg.pose_frontal_eye_shoulder_ratio
 
     @staticmethod
     def _landmark_point(landmark: object, crop_bbox: BBox) -> Point | None:
