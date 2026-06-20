@@ -85,3 +85,11 @@ Thumbs.db
 # Claude / Gemini
 .claude/
 .claude/projects/
+CLAUDE.md
+
+# go2rtc binaries
+go2rtc/go2rtc
+
+# Generated utility scripts
+scripts/download_models.py
+scripts/start_go2rtc.sh
