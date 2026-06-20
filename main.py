@@ -8,6 +8,8 @@ from typing import cast
 import numpy as np
 from loguru import logger
 
+from api.app import create_app
+from api.server import VisionAPIServer
 from capture.frame_producer import FrameProducer
 from config import PipelineConfig
 from detection.face_detector import FaceDetection, FaceDetector
@@ -19,6 +21,8 @@ from detection.person_detector import PersonDetection, PersonDetector
 from events.dispatcher import EventDispatcher
 from identification.face_identifier import FaceIdentifier
 from quality.face_quality_gate import FaceQualityGate
+from services.enrollment_service import EnrollmentService
+from services.tracking_service import TrackingService
 from streaming.vision_state import FallRegion, TrackedFace, TrackedPerson, VisionState
 from streaming.vision_ws_server import VisionWSServer
 from tracking.tracker_manager import TrackerManager
@@ -67,6 +71,25 @@ class VisionPipeline:
         )
         self._fall_det = FallDetector(cfg)
         self._identifier = FaceIdentifier(cfg, self._tracker_mgr)
+        self._enrollment_service = EnrollmentService(
+            cfg=cfg,
+            face_detector=self._face_det,
+            identifier=self._identifier,
+            gallery_store=self._identifier.gallery_store,
+        )
+        self._tracking_service = TrackingService(
+            tracker_manager=self._tracker_mgr,
+            enrollment_service=self._enrollment_service,
+            identifier=self._identifier,
+        )
+        self._api_server = VisionAPIServer(
+            cfg,
+            create_app(
+                enrollment_service=self._enrollment_service,
+                tracking_service=self._tracking_service,
+                cors_origins=cfg.vision_api_cors_origins,
+            ),
+        )
         self._frame_counter = 0
         self._last_state_time = 0.0
         self._fps = 0.0
@@ -78,6 +101,7 @@ class VisionPipeline:
         self._cfg.preflight()
         self._producer.open()
         self._ws_server.start()
+        self._api_server.start()
         self._running = True
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -99,6 +123,7 @@ class VisionPipeline:
                 ("dispatcher", self._dispatcher.shutdown),
                 ("frame producer", self._producer.release),
                 ("vision websocket", self._ws_server.stop),
+                ("vision api", self._api_server.stop),
             )
             for name, shutdown_fn in cleanup_steps:
                 try:

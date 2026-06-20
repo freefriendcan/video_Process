@@ -31,11 +31,20 @@ class FakeWSServer:
         self.stop_calls += 1
 
 
+class FakeAPIServer:
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+
 def test_shutdown_is_idempotent():
     pipeline = VisionPipeline.__new__(VisionPipeline)
     dispatcher = FakeDispatcher()
     producer = FakeProducer()
     ws_server = FakeWSServer()
+    api_server = FakeAPIServer()
 
     pipeline._running = True
     pipeline._shutdown_lock = threading.Lock()
@@ -43,6 +52,7 @@ def test_shutdown_is_idempotent():
     pipeline._dispatcher = dispatcher
     pipeline._producer = producer
     pipeline._ws_server = ws_server
+    pipeline._api_server = api_server
 
     assert pipeline.shutdown() is True
     assert pipeline.shutdown() is False
@@ -52,3 +62,4 @@ def test_shutdown_is_idempotent():
     assert dispatcher.shutdown_calls == 1
     assert producer.release_calls == 1
     assert ws_server.stop_calls == 1
+    assert api_server.stop_calls == 1

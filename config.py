@@ -98,7 +98,15 @@ class PipelineConfig:
     # Local ArcFace identification
     arcface_model_name: str = "buffalo_l"
     gallery_path: str = "data/embeddings/faces.pkl"
+    face_db_path: str = "data/embeddings/faces.db"
     face_match_cosine_threshold: float = 0.35
+
+    # Enrollment REST API
+    vision_api_enabled: bool = True
+    vision_api_host: str = "0.0.0.0"
+    vision_api_port: int = 8800
+    enrollment_max_width: int = 640
+    vision_api_cors_origins: tuple[str, ...] = ("*",)
 
     # Person crop padding for pose
     person_crop_pad: float = 0.15
@@ -214,6 +222,17 @@ class PipelineConfig:
         self.ws_vision_host = os.environ.get("WS_VISION_HOST", self.ws_vision_host)
         self.ws_vision_port = _env_int("WS_VISION_PORT", self.ws_vision_port)
         self.ws_vision_fps = _env_float("WS_VISION_FPS", self.ws_vision_fps)
+        self.face_db_path = os.environ.get("FACE_DB_PATH", self.face_db_path)
+        self.vision_api_enabled = _env_bool("VISION_API_ENABLED", self.vision_api_enabled)
+        self.vision_api_host = os.environ.get("VISION_API_HOST", self.vision_api_host)
+        self.vision_api_port = _env_int("VISION_API_PORT", self.vision_api_port)
+        self.enrollment_max_width = _env_int("ENROLLMENT_MAX_WIDTH", self.enrollment_max_width)
+
+        cors_env = os.environ.get("VISION_API_CORS_ORIGINS")
+        if cors_env is not None and cors_env.strip():
+            self.vision_api_cors_origins = tuple(
+                origin.strip() for origin in cors_env.split(",") if origin.strip()
+            )
         self.fall_pose_aspect = _env_float("FALL_POSE_ASPECT", self.fall_pose_aspect)
         self.person_identity_eviction_s = _env_float(
             "PERSON_IDENTITY_EVICTION_S",

@@ -10,6 +10,8 @@ from loguru import logger
 
 from config import PipelineConfig
 from detection.onnx_runtime import BBox, NormalizedKeypoint
+from identification.gallery_store import GalleryStore
+from repositories.face_repository import FaceRepository
 from tracking.tracker_manager import TrackerManager
 
 
@@ -26,10 +28,16 @@ class _FaceAlignModule(Protocol):
 class FaceIdentifier:
     """Local ArcFace identifier backed by the enrolled embeddings gallery."""
 
-    def __init__(self, cfg: PipelineConfig, tracker_mgr: TrackerManager) -> None:
+    def __init__(
+        self,
+        cfg: PipelineConfig,
+        tracker_mgr: TrackerManager,
+        gallery_store: GalleryStore | None = None,
+    ) -> None:
         self._cfg = cfg
         self._tracker_mgr = tracker_mgr
-        self._gallery = self._load_gallery(Path(cfg.gallery_path))
+        self._gallery_store: GalleryStore | None = gallery_store or self._build_gallery_store(cfg)
+        self._gallery: dict[str, np.ndarray] = {}
         self._recognition_model, self._face_align = self._load_arcface_model()
 
     @classmethod
@@ -43,8 +51,19 @@ class FaceIdentifier:
         self = cls.__new__(cls)
         self._cfg = cfg
         self._gallery = {}
+        self._gallery_store = None
         self._recognition_model, self._face_align = self._load_arcface_model()
         return self
+
+    @property
+    def gallery_store(self) -> GalleryStore:
+        if self._gallery_store is None:
+            raise RuntimeError("Enrollment-only FaceIdentifier has no gallery store")
+        return self._gallery_store
+
+    @property
+    def model_loaded(self) -> bool:
+        return self._recognition_model is not None
 
     def identify(
         self,
@@ -146,6 +165,31 @@ class FaceIdentifier:
             raise ValueError("Enrollment gallery is empty")
         return gallery
 
+    def _build_gallery_store(self, cfg: PipelineConfig) -> GalleryStore:
+        repository = FaceRepository(cfg.face_db_path)
+        store = GalleryStore(repository)
+        if store.user_count() > 0:
+            return store
+
+        gallery_path = Path(cfg.gallery_path)
+        if not gallery_path.exists():
+            logger.warning("Enrollment DB is empty and no pickle fallback exists: {}", gallery_path)
+            return store
+
+        try:
+            fallback_gallery = self._load_gallery(gallery_path)
+        except Exception as exc:
+            logger.warning("Enrollment pickle fallback could not be loaded: {}", exc)
+            return store
+
+        store.import_gallery(fallback_gallery)
+        logger.info(
+            "Imported pickle enrollment gallery into SQLite: {} users -> {}",
+            len(fallback_gallery),
+            repository.db_path,
+        )
+        return store
+
     def _load_arcface_model(self) -> tuple[_RecognitionModel, _FaceAlignModule]:
         try:
             from insightface.model_zoo import get_model
@@ -197,7 +241,12 @@ class FaceIdentifier:
         best_label: str | None = None
         best_score = -1.0
 
-        for label, gallery_embeddings in self._gallery.items():
+        gallery = (
+            self._gallery_store.snapshot()
+            if self._gallery_store is not None
+            else self._gallery
+        )
+        for label, gallery_embeddings in gallery.items():
             scores = gallery_embeddings @ embedding
             score = float(np.max(scores))
             if score > best_score:
