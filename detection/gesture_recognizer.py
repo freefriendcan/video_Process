@@ -1,7 +1,7 @@
 import os
 import time
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 import mediapipe as mp
@@ -15,26 +15,37 @@ from events.dispatcher import EventDispatcher
 
 
 class WristPose(Protocol):
+    track_id: int
     bbox: tuple[int, int, int, int]
     left_wrist: tuple[float, float] | None
     right_wrist: tuple[float, float] | None
 
 
+HandBBox = tuple[int, int, int, int]
+TrackedHandBBox = tuple[HandBBox, int]
+
+
 class GestureRecognizer:
     """Async MediaPipe gesture recognizer with gaze-lock and sustained-gesture logic."""
 
-    def __init__(self, cfg: PipelineConfig, dispatcher: EventDispatcher, get_active_user):
+    def __init__(
+        self,
+        cfg: PipelineConfig,
+        dispatcher: EventDispatcher,
+        get_user_for_track: Callable[[int | None], str],
+    ) -> None:
         """
         Args:
-            get_active_user: callable returning the current identified user name (thread-safe)
+            get_user_for_track: thread-safe identity resolver for a person
+                track id, or full-frame fallback when the track id is None.
         """
         self._cfg = cfg
         self._dispatcher = dispatcher
-        self._get_active_user = get_active_user
+        self._get_user_for_track = get_user_for_track
 
         self._latest_gesture = ""
         self._latest_gesture_time = 0.0
-        self._is_processing = False
+        self._pending_track_id: int | None = None
         self._current_sustained = ""
         self._gesture_start_time = 0.0
         self._last_sent = ""
@@ -81,7 +92,7 @@ class GestureRecognizer:
         if current_time - self._latest_gesture_time > timeout:
             self._latest_gesture = ""
 
-    def _on_result(self, result, output_image: mp.Image, timestamp_ms: int):
+    def _on_result(self, result, output_image: mp.Image, timestamp_ms: int) -> None:
         if result.gestures:
             for hand_gestures in result.gestures:
                 top_gesture = hand_gestures[0].category_name
@@ -115,7 +126,7 @@ class GestureRecognizer:
                                 top_gesture,
                                 duration,
                             )
-                            detected_user = self._get_active_user()
+                            detected_user = self._get_user_for_track(self._pending_track_id)
                             self._dispatcher.submit(
                                 self._dispatcher.send_gesture_event,
                                 top_gesture, duration, detected_user,
@@ -124,8 +135,6 @@ class GestureRecognizer:
                             self._last_sent_time = time.time()
         else:
             self._current_sustained = ""
-
-        self._is_processing = False
 
     def process(
         self,
@@ -139,23 +148,28 @@ class GestureRecognizer:
         self._last_timestamp_ms = current_ms
 
         try:
-            roi = self._hand_roi(rgb_frame, poses)
+            roi, track_id = self._hand_roi(rgb_frame, poses)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi.copy())
             self._async_image_buffer.append(mp_image)
             if len(self._async_image_buffer) > 30:
                 self._async_image_buffer.pop(0)
 
-            if not self._is_processing:
-                self._is_processing = True
-                self._recognizer.recognize_async(mp_image, current_ms)
+            self._pending_track_id = track_id
+            self._recognizer.recognize_async(mp_image, current_ms)
         except Exception:
-            self._is_processing = False
+            pass
 
-    def _hand_roi(self, rgb_frame: np.ndarray, poses: Sequence[WristPose] | None) -> np.ndarray:
-        bbox = self._raw_hand_bbox(rgb_frame, poses)
-        if bbox is None:
+    def _hand_roi(
+        self,
+        rgb_frame: np.ndarray,
+        poses: Sequence[WristPose] | None,
+    ) -> tuple[np.ndarray, int | None]:
+        raw = self._raw_hand_bbox(rgb_frame, poses)
+        if raw is None:
             self._smoothed_hand_bbox = None
-            return rgb_frame
+            return rgb_frame, None
+
+        bbox, track_id = raw
 
         if self._smoothed_hand_bbox is None:
             smoothed = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
@@ -180,14 +194,14 @@ class GestureRecognizer:
         x2 = max(0, min(frame_w, x + max(1, w)))
         y2 = max(0, min(frame_h, y + max(1, h)))
         if x2 <= x1 or y2 <= y1:
-            return rgb_frame
-        return rgb_frame[y1:y2, x1:x2]
+            return rgb_frame, track_id
+        return rgb_frame[y1:y2, x1:x2], track_id
 
     def _raw_hand_bbox(
         self,
         rgb_frame: np.ndarray,
         poses: Sequence[WristPose] | None,
-    ) -> tuple[int, int, int, int] | None:
+    ) -> TrackedHandBBox | None:
         if not poses:
             return None
 
@@ -210,15 +224,18 @@ class GestureRecognizer:
             x2 = min(frame_w, int(round(max(xs) + pad)))
             y2 = min(frame_h, int(round(max(ys) + pad)))
             if x2 > x1 and y2 > y1:
-                return x1, y1, x2 - x1, y2 - y1
+                return (x1, y1, x2 - x1, y2 - y1), pose.track_id
 
             fallback_w = max(1, int(round(person_w * self._cfg.hand_crop_pad)))
             fallback_h = max(1, int(round(person_h * self._cfg.hand_crop_pad)))
             return (
-                max(0, min(frame_w, person_x)),
-                max(0, min(frame_h, person_y)),
-                min(frame_w - person_x, fallback_w),
-                min(frame_h - person_y, fallback_h),
+                (
+                    max(0, min(frame_w, person_x)),
+                    max(0, min(frame_h, person_y)),
+                    min(frame_w - person_x, fallback_w),
+                    min(frame_h - person_y, fallback_h),
+                ),
+                pose.track_id,
             )
 
         return None

@@ -502,6 +502,27 @@ class TrackerManager:
                     return t_data["user"]
         return "Unknown"
 
+    def user_for_person_track(self, track_id: int | None) -> str:
+        """Resolve a person track identity for gesture attribution.
+
+        If a track id is supplied, attribution is strict to that person track.
+        The fallback to any identified person is used only when the gesture ROI
+        came from the full frame and no pose track was available.
+        """
+        with self._lock:
+            if track_id is not None:
+                record = self._person_tracks.get(track_id)
+                if record is None:
+                    return "Unknown"
+                user = record.emitted_user or record.user
+                return user if user not in ("Unknown", "Identifying...") else "Unknown"
+
+            for record in self._person_tracks.values():
+                user = record.emitted_user or record.user
+                if user not in ("Unknown", "Identifying..."):
+                    return user
+        return "Unknown"
+
     def exists(self, tracker_id):
         with self._lock:
             return tracker_id in self._trackers

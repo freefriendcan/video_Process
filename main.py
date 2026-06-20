@@ -67,7 +67,7 @@ class VisionPipeline:
         self._gesture_rec = GestureRecognizer(
             cfg,
             self._dispatcher,
-            self._tracker_mgr.get_active_user,
+            self._tracker_mgr.user_for_person_track,
         )
         self._fall_det = FallDetector(cfg)
         self._identifier = FaceIdentifier(cfg, self._tracker_mgr)
