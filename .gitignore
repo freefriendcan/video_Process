@@ -75,9 +75,6 @@ data/test_videos/*
 !data/recordings/.gitkeep
 !data/test_videos/.gitkeep
 
-# Planning / handoff scratch docs (not part of the tracked repo)
-*_PLAN.md
-
 # OS
 .DS_Store
 Thumbs.db
@@ -88,4 +85,3 @@ Thumbs.db
 # Claude / Gemini
 .claude/
 .claude/projects/
-CLAUDE.md
